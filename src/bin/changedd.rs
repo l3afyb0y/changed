@@ -1,4 +1,6 @@
 use changed::app::{App, DaemonOptions};
+use changed::scope::Scope;
+use nix::unistd::Uid;
 use std::env;
 use std::time::Duration;
 
@@ -10,22 +12,26 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let options = parse_args(env::args().skip(1))?;
+    let (scope, options) = parse_args(env::args().skip(1))?;
+    ensure_privileged_scope(scope)?;
     let app = App::new()?;
-    println!("{}", app.run_daemon(options)?);
+    println!("{}", app.run_daemon(scope, options)?);
     Ok(())
 }
 
-fn parse_args<I>(args: I) -> anyhow::Result<DaemonOptions>
+fn parse_args<I>(args: I) -> anyhow::Result<(Scope, DaemonOptions)>
 where
     I: IntoIterator<Item = String>,
 {
+    let mut scope = Scope::User;
     let mut once = false;
     let mut interval_seconds = 2u64;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--system" => scope = Scope::System,
+            "--user" => scope = Scope::User,
             "--once" => once = true,
             "--interval-seconds" => {
                 let value = args
@@ -49,17 +55,29 @@ where
         }
     }
 
-    Ok(DaemonOptions {
-        once,
-        interval: Duration::from_secs(interval_seconds),
-    })
+    Ok((
+        scope,
+        DaemonOptions {
+            once,
+            interval: Duration::from_secs(interval_seconds),
+        },
+    ))
 }
 
 fn print_help() {
     println!(
         "changedd - dedicated daemon for changed\n\n\
 Usage:\n  changedd [options]\n\n\
-Options:\n  --once                     Run one scan cycle and exit\n  --interval-seconds SECONDS Polling interval in seconds for fallback waiting\n  -h, --help                 Show this help text\n  -V, --version              Show version\n\n\
-Examples:\n  changedd\n  changedd --once\n  changedd --interval-seconds 5"
+Options:\n  --once                     Run one scan cycle and exit\n  --interval-seconds SECONDS Polling interval in seconds for fallback waiting\n  --system                   Run in system scope\n  --user                     Run in user scope\n  -h, --help                 Show this help text\n  -V, --version              Show version\n\n\
+Examples:\n  changedd --user\n  changedd --system --once\n  changedd --user --interval-seconds 5"
     );
+}
+
+fn ensure_privileged_scope(scope: Scope) -> anyhow::Result<()> {
+    if scope == Scope::System && !Uid::effective().is_root() {
+        return Err(anyhow::anyhow!(
+            "system scope requires elevated privileges. Re-run with sudo or use --user."
+        ));
+    }
+    Ok(())
 }

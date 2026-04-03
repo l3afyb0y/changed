@@ -1,0 +1,14 @@
+[Unit]
+Description=changed user tuning changelog daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/changedd --user
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

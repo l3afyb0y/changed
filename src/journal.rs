@@ -1,4 +1,5 @@
 use crate::category::Category;
+use crate::scope::Scope;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -13,6 +14,8 @@ pub enum EventKind {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct JournalEvent {
     pub timestamp: OffsetDateTime,
+    #[serde(default)]
+    pub scope: Scope,
     pub kind: EventKind,
     pub category: Category,
     pub path: String,

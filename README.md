@@ -14,21 +14,12 @@ It is not a backup, rollback, or recovery tool.
 
 The core tracking loop exists today and is usable for local development:
 
-- `changed` manages config, tracked targets, history views, and policy
-- `changedd` captures a baseline, watches tracked paths, and appends journal
-  events
-
-The project is not yet integrated with systemd. The `changed service ...`
-command family is still reserved placeholder surface for that work.
-
-This repository currently has two layers of documentation:
-
-- current implementation notes for what the code already does
-- next-step CLI and service design notes for the changes we agreed on before
-  systemd integration
-
-That split is intentional. The CLI scope model is evolving, and the docs should
-capture the design decisions before we wire them into code.
+- `changed` manages user and system scoped config, tracked targets, history
+  views, and diff/redaction policy
+- `changedd` captures a baseline, watches one selected scope, and appends
+  journal events
+- `changed service` can now install, start, stop, and inspect scoped systemd
+  services
 
 ## Current Shape
 
@@ -56,18 +47,19 @@ cargo run --bin changedd -- --help
 Typical local development flow:
 
 ```bash
-cargo run --bin changed -- init
-cargo run --bin changed -- track /etc/makepkg.conf
-cargo run --bin changed -- track category shell
-cargo run --bin changedd -- --once
-cargo run --bin changed -- list -t
-cargo run --bin changed -- list -a
-cargo run --bin changed -- list -C
+cargo run --bin changed -- init -U
+cargo run --bin changed -- init -S
+cargo run --bin changed -- track -U ~/.config/fish/config.fish
+sudo cargo run --bin changed -- track -S /boot/loader/entries/arch.conf
+cargo run --bin changedd -- --user --once
+sudo cargo run --bin changedd -- --system --once
+cargo run --bin changed -- list -U -C
+sudo cargo run --bin changed -- list -SU -a
 ```
 
 ## Project Direction
 
-The project is moving toward two scopes of tracking:
+The project now supports two scopes of tracking:
 
 - system scope for machine-wide tuning such as `/etc`, `/boot`, loader entries,
   systemd units, and kernel cmdline files
@@ -78,51 +70,89 @@ This is meant to support:
 
 - a system log visible to privileged users
 - one private user log per user
-- separate system and user services later, even though they will share the same
-  `changedd` binary
+- separate system and user services, both using the same `changedd` binary
 
 See [docs/scope-model.md](docs/scope-model.md) for the detailed design.
 
 ## What Works Today
 
-- Track exact files
+- Track exact files in user or system scope
 - Track preset categories like `shell`, `build`, or `services`
+- Infer scope for path-based writes when the path is obviously user or system
 - Enable or disable diff storage per path
 - Enable or disable redaction per path
+- Filter history with `-i/--include` and `-e/--exclude`
+- Read merged history with `-SU` or with no scope flags
 - Auto-reload daemon config when tracked targets change
 - Append a structured journal and render it as a readable changelog
 - Show a low-noise daily view with `changed list -C`
+- Install and control scoped systemd services from the CLI
 
 ## What Does Not Exist Yet
 
-- systemd unit installation and service lifecycle management
 - package event tracking
 - service state event tracking
 - a dedicated `status` command for daemon diagnostics
 
-The `changed service ...` CLI surface is still placeholder-only until systemd
-integration lands.
+## Scope-Aware CLI
 
-## Planned Next CLI Revision
+Read commands support composable scope flags:
 
-Before systemd integration, the next CLI pass is expected to add:
+- `-S, --system`
+- `-U, --user`
 
-- `-S, --system` for system-scope reads and writes
-- `-U, --user` for user-scope reads and writes
-- composable read scopes like `-SU`
-- merged default reads when no scope flag is provided
-- `-i, --include <CATEGORY>` for category inclusion filters
-- `-e, --exclude <CATEGORY>` for category exclusion filters
+Examples:
 
-For write operations such as `track` and `untrack`:
+```bash
+changed list
+changed list -U
+sudo changed list -S
+sudo changed list -SU -a -C
+```
 
-- exactly one scope should be targeted
-- path-based auto-detection may be used when the scope is obvious
-- if scope is unclear, the command should fail and ask the user to specify
-  `-S` or `-U`
+If system scope is requested without privilege, `changed` now fails clearly and
+asks you to re-run with `sudo` or narrow to `-U`.
 
-These flags are part of the current design direction, but they are not all
-implemented yet.
+List filtering uses:
+
+- `-i, --include <CATEGORY>`
+- `-e, --exclude <CATEGORY>`
+
+Examples:
+
+```bash
+changed list -i services
+changed list -e packages
+changed list -SU -C -i cpu -i gpu -e services
+```
+
+For write operations such as `track`, `untrack`, `diff`, and `redact`:
+
+- exactly one scope is targeted
+- path-based writes may infer scope when the path is obvious
+- if scope is unclear, the command fails and asks for `-S` or `-U`
+- category and package writes should be given an explicit scope
+
+## Service Integration
+
+Service commands now require an explicit scope:
+
+- `changed service -U install`
+- `changed service -U start`
+- `changed service -U stop`
+- `changed service -U status`
+- `sudo changed service -S install`
+- `sudo changed service -S start`
+
+Behavior:
+
+- `install` writes a scope-appropriate unit file and runs `daemon-reload`
+- `start` runs `systemctl enable --now` for that scope
+- `stop` runs `systemctl disable --now` for that scope
+- `status` shows `systemctl status` output for that scope
+
+For local development installs, unit files are generated dynamically and point
+at the sibling `changedd` binary next to the current `changed` executable.
 
 ## Journal Behavior
 
@@ -133,6 +163,8 @@ implemented yet.
   newer ones.
 - `changed list` shows a recent view by default. Use `changed list -a` for the
   full retained journal.
+- `changed list` with no scope flags reads merged system plus current-user
+  history.
 - `-C, --clean-view` changes presentation only. It does not delete or rewrite
   history.
 
@@ -177,6 +209,11 @@ redaction = "auto"
 source = "preset"
 ```
 
+System scope uses separate config and state roots:
+
+- config: `/etc/changed/config.toml`
+- state: `/var/lib/changed/`
+
 ## Safety Model
 
 Tracking, diffing, and redaction are separate controls:
@@ -201,19 +238,30 @@ behind `sudo`.
 
 ## Files
 
+User scope:
+
 - Config: `~/.config/changed/config.toml`
 - State: `~/.local/state/changed/`
 - Journal: `~/.local/state/changed/journal.jsonl`
 - Daemon state: `~/.local/state/changed/daemon-state.json`
 
+System scope:
+
+- Config: `/etc/changed/config.toml`
+- State: `/var/lib/changed/`
+- Journal: `/var/lib/changed/journal.jsonl`
+- Daemon state: `/var/lib/changed/daemon-state.json`
+
 Environment overrides:
 
 - `CHANGED_CONFIG_HOME`
 - `CHANGED_STATE_HOME`
+- `CHANGED_SYSTEM_CONFIG_HOME`
+- `CHANGED_SYSTEM_STATE_HOME`
 
 ## Example Output
 
-For the intended human-readable changelog style, see [example.md](example.md).
+For the intended human-readable changelog style, see [example-log.md](example-log.md).
 
 ## Documentation
 
@@ -221,3 +269,15 @@ For the intended human-readable changelog style, see [example.md](example.md).
 - [CLI help drafts](docs/help-text.md)
 - [Man-page-style reference](docs/changed.1.md)
 - [Category definitions](docs/categories.md)
+
+## Arch Packaging
+
+This repo now includes a local-source [PKGBUILD](PKGBUILD) and packaged unit
+files under [packaging/systemd/system/changedd.service](/home/rowen/github-branches/changed/packaging/systemd/system/changedd.service) and [packaging/systemd/user/changedd.service](/home/rowen/github-branches/changed/packaging/systemd/user/changedd.service).
+
+The PKGBUILD installs:
+
+- `changed`
+- `changedd`
+- both systemd unit files
+- project documentation and license files

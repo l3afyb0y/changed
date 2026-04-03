@@ -1,10 +1,8 @@
 # Scope Model
 
-This document describes the intended scope and security model for `changed`
-before systemd integration lands.
+This document describes the current scope and security model for `changed`.
 
-It is a design document for the next CLI revision, not a claim that every part
-of this behavior is already implemented.
+It is the foundation for the upcoming systemd integration work.
 
 ## Why Scopes Exist
 
@@ -43,7 +41,7 @@ Examples:
 
 ## CLI Scope Flags
 
-The intended scope flags are:
+The scope flags are:
 
 - `-S, --system`
 - `-U, --user`
@@ -52,10 +50,12 @@ The intended scope flags are:
 
 For read-oriented commands such as `changed list`:
 
-- no scope flag should mean merged default view
-- `-S` should mean system scope only
-- `-U` should mean current-user scope only
-- `-SU` should mean explicit merged view of system plus current user
+- no scope flag means merged default view
+- `-S` means system scope only
+- `-U` means current-user scope only
+- `-SU` is an explicit merged view of system plus current user
+- requesting system scope without privilege should fail clearly and suggest
+  re-running with `sudo` or using `-U`
 
 Examples:
 
@@ -66,13 +66,13 @@ Examples:
 
 ### Write Commands
 
-For write-oriented commands such as `track` and `untrack`:
+For write-oriented commands such as `track`, `untrack`, `diff`, and `redact`:
 
-- exactly one scope should be targeted
-- `-SU` should be invalid
+- exactly one scope must be targeted
+- `-SU` is invalid
 - when no scope flag is provided, scope may be inferred only if the path is
   clearly user or clearly system
-- if scope is not obvious, the command should fail
+- if scope is not obvious, the command fails
 
 Expected error shape:
 
@@ -85,15 +85,16 @@ Examples:
 - `changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U ~/.config/fish/config.fish`
 
+For category and package writes, scope should be given explicitly.
+
 ## Category Filters
 
-The current design direction is to replace `--category` with symmetric include
-and exclude filters:
+Category filtering uses symmetric include and exclude flags:
 
 - `-i, --include <CATEGORY>`
 - `-e, --exclude <CATEGORY>`
 
-They should be repeatable.
+They are repeatable.
 
 Examples:
 
@@ -116,19 +117,19 @@ Instead, data should be private to its scope owner:
 - system logs and state should be root-owned and root-readable only
 - user logs, state, and config should be owned by the user and created with
   private permissions
-- reading system-scope logs should require privilege
+- reading system-scope logs generally requires privilege
 - reading another user's logs should require privilege and an explicit future
   user-selection mechanism
 
-This is meant to reduce accidental exposure without breaking normal user-scope
-tracking workflows.
+This reduces accidental exposure without breaking normal user-scope tracking
+workflows.
 
 ## Services
 
-The long-term service model is:
+The current service model is:
 
-- one system service using `changedd`
-- one optional user service per user, also using `changedd`
+- one system service using `changedd --system`
+- one optional user service per user using `changedd --user`
 
 The intended enable flows are separate:
 
@@ -138,12 +139,12 @@ The intended enable flows are separate:
 That keeps user tracking opt-in and avoids surprising users with automatic
 per-user background services.
 
-## Open Questions
+## Remaining Questions
 
-These are the main design questions still worth revisiting before service work:
+These are still worth revisiting before service work:
 
-- should the merged default read view always include both system and current
-  user scopes
-- how should explicit current-user selection look if we later add root-only
-  inspection of other users' logs
+- how to present merged reads when system scope exists but the current user
+  lacks permission to read it
+- how explicit user selection should look if we later add root-only inspection
+  of other users' logs
 - whether user-level logs should eventually support optional encryption at rest

@@ -28,20 +28,21 @@ It is designed to answer:
 
 ## STATUS
 
-The current codebase already provides:
+The current codebase provides:
 
 - a working CLI
 - a dedicated daemon binary
+- user and system scoped config/state roots
 - file-backed journaling
 - diff and redaction controls
-- category-aware rendering
+- category-aware rendering with include/exclude filters
+- scoped systemd service install/start/stop/status commands
 
-The service layer and final scope-aware CLI are still being finalized before
-systemd integration.
+Package tracking and service-state event tracking are still future work.
 
 ## SCOPE MODEL
 
-The intended design now has two scopes:
+`changed` now works with two scopes:
 
 - system scope
 - user scope
@@ -51,7 +52,7 @@ System scope is for machine-wide tuning such as:
 - `/etc`
 - `/boot/loader/entries`
 - system units
-- system-wide scheduler or boot config
+- boot and scheduler config
 
 User scope is for per-user tuning such as:
 
@@ -60,17 +61,17 @@ User scope is for per-user tuning such as:
 - user services
 - user audio or desktop tuning
 
-The intended scope flags are:
+The scope flags are:
 
 - `-S`, `--system`
 - `-U`, `--user`
 
-For read commands, no scope flag should default to merged output from both
-system scope and the current user's scope.
+For read commands, no scope flag defaults to merged output from both system
+scope and the current user's scope. `-SU` is a valid explicit merged read.
 
-For write commands, exactly one scope should be targeted. If scope is not
-obvious and cannot be inferred safely, the command should fail and ask the user
-to specify `-S` or `-U`.
+For write commands, exactly one scope must be targeted. If scope cannot be
+inferred safely for a path-based write, the command should fail and ask the
+user to specify `-S` or `-U`.
 
 See also [docs/scope-model.md](scope-model.md).
 
@@ -78,14 +79,17 @@ See also [docs/scope-model.md](scope-model.md).
 
 ### `init`
 
-Initialize configuration, state directories, and default tracking presets.
+Initialize configuration, state directories, and default tracking presets for a
+single scope.
 
 ### `daemon`
 
-Run the tracking daemon in the foreground.
+Run the tracking daemon in the foreground for one selected scope.
 
 Supported today:
 
+- `-S`, `--system`
+- `-U`, `--user`
 - `--once`
 - `--interval-seconds <seconds>`
 
@@ -95,53 +99,52 @@ For long-running daemon use, prefer the dedicated binary `changedd`.
 
 Manage the systemd service.
 
-Planned actions:
+Supported actions:
 
 - `install`
 - `start`
 - `stop`
 - `status`
 
-This interface is intentionally present before systemd integration lands.
+Service commands require an explicit scope.
+
+Current behavior:
+
+- `install` writes a scope-specific unit file and runs `daemon-reload`
+- `start` runs `enable --now` for that scope
+- `stop` runs `disable --now` for that scope
+- `status` runs `systemctl status` for that scope
 
 ### `track`
 
-Track a file path, category preset, or package target.
+Track a file path, category preset, or package target in one scope.
 
-Planned direction:
+Examples:
 
-- `changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U ~/.config/fish/config.fish`
+- `sudo changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U category shell`
 
 ### `untrack`
 
-Remove a tracked file path, category preset, or package target.
-
-Writes should target one scope only.
+Remove a tracked file path, category preset, or package target in one scope.
 
 ### `list`
 
 Show the changelog or tracked targets.
 
-Current implementation includes:
+Supported today:
 
-- `--tracked`, `-t`
-- `--path`, `-p <file_path>`
-- `--all`, `-a`
-- `--since`, `-s <time>`
-- `--until`, `-u <time>`
-- `--clean-view`, `-C`
-
-The next CLI revision is expected to replace category filtering with:
-
-- `--include`, `-i <category>`
-- `--exclude`, `-e <category>`
-
-And add scope filtering with:
-
-- `--system`, `-S`
-- `--user`, `-U`
+- `-S`, `--system`
+- `-U`, `--user`
+- `-t`, `--tracked`
+- `-i`, `--include <category>`
+- `-e`, `--exclude <category>`
+- `-p`, `--path <file_path>`
+- `-a`, `--all`
+- `-s`, `--since <time>`
+- `-u`, `--until <time>`
+- `-C`, `--clean-view`
 
 ### `diff <action> <path>`
 
@@ -169,16 +172,16 @@ Default output should:
 
 - show a recent slice of history
 - group entries in a readable changelog style
-- merge system plus current-user scopes once the scope model lands
+- merge system plus current-user scopes when no scope flags are given
 
-`changed list -a` should show the full retained history.
+`changed list -a` shows the full retained history.
 
-`changed list -C` should provide a low-noise day-to-day reading mode.
+`changed list -C` provides a low-noise day-to-day reading mode.
 
-`--clean-view` changes presentation only. It must not delete data, alter
+`--clean-view` changes presentation only. It does not delete data, alter
 history, or change what the daemon stores.
 
-The intended category filter semantics are:
+Category filter semantics:
 
 - `-i`, `--include` means only these categories
 - `-e`, `--exclude` removes categories from the result
@@ -194,10 +197,17 @@ The daemon currently uses an event-driven watcher with scan/diff verification.
 - Newly added tracked targets are silently baselined on reload.
 - Existing tracked targets preserve prior observation state across reloads.
 
-The long-term service design is expected to use the same `changedd` binary for:
+The same `changedd` binary now supports both:
+
+- `--system`
+- `--user`
+
+This is intended to become:
 
 - one system service
 - one optional user service per user
+
+Packaged unit files are also provided for Arch installs.
 
 ## SECURITY MODEL
 
@@ -224,18 +234,20 @@ With two binaries in the workspace, local cargo runs should be explicit:
 - `cargo run --bin changed -- --help`
 - `cargo run --bin changedd -- --help`
 
-Typical local flow today:
+Typical local flow:
 
-- `cargo run --bin changed -- init`
-- `cargo run --bin changed -- track /etc/makepkg.conf`
-- `cargo run --bin changedd -- --once`
-- `cargo run --bin changed -- list -a`
+- `cargo run --bin changed -- init -U`
+- `cargo run --bin changed -- init -S`
+- `cargo run --bin changed -- track -U ~/.config/fish/config.fish`
+- `cargo run --bin changedd -- --user --once`
+- `cargo run --bin changed -- list -SU -a`
+- `cargo run --bin changed -- service -U install`
 
 ## PACKAGE TRACKING
 
-Package tracking should stay optional and disabled by default.
+Package tracking stays optional and disabled by default.
 
-When added, package events should prefer:
+When expanded later, package events should prefer:
 
 - installs
 - removals
@@ -246,21 +258,26 @@ changelog with normal Arch maintenance activity.
 
 ## FILES
 
-Current user-scope locations:
+User scope:
 
 - config: `~/.config/changed/config.toml`
 - state: `~/.local/state/changed/`
 - journal: `~/.local/state/changed/journal.jsonl`
 - daemon state: `~/.local/state/changed/daemon-state.json`
 
-Planned system-scope location:
+System scope:
 
-- system state: `/var/lib/changed/`
+- config: `/etc/changed/config.toml`
+- state: `/var/lib/changed/`
+- journal: `/var/lib/changed/journal.jsonl`
+- daemon state: `/var/lib/changed/daemon-state.json`
 
-Environment overrides in the current implementation:
+Environment overrides:
 
 - `CHANGED_CONFIG_HOME`
 - `CHANGED_STATE_HOME`
+- `CHANGED_SYSTEM_CONFIG_HOME`
+- `CHANGED_SYSTEM_STATE_HOME`
 
 ## RETENTION
 
@@ -276,24 +293,20 @@ old history can roll off over time until archival support exists.
 
 ## EXAMPLES
 
-- `changed init`
-- `changed track /etc/makepkg.conf`
-- `changed track category shell`
-- `changed diff enable /etc/makepkg.conf`
-- `changed redact enable ~/.config/fish/config.fish`
 - `changed list`
-- `changed list -a`
-- `changed list -C`
-- `changed list -t`
-
-Planned next-step examples:
-
-- `changed list -U -C`
-- `sudo changed list -SU -a`
+- `changed list -U`
+- `sudo changed list -S`
+- `sudo changed list -SU -a -C`
 - `changed list -i services`
 - `changed list -e packages`
 - `sudo changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U ~/.config/fish/config.fish`
+- `changed diff -U enable ~/.config/fish/config.fish`
+- `sudo changed redact -S disable /etc/makepkg.conf`
+- `changed service -U install`
+- `changed service -U start`
+- `sudo changed service -S install`
+- `sudo changed service -S status`
 
 ## NOTES
 
@@ -306,4 +319,4 @@ See also:
 - `docs/help-text.md`
 - `docs/scope-model.md`
 - `docs/categories.md`
-- `example.md`
+- `example-log.md`

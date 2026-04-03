@@ -52,3 +52,6 @@ target
 # Local test and coverage output
 coverage/
 dist/
+
+# Built Arch packages
+*.pkg.tar.*

@@ -1,0 +1,14 @@
+[Unit]
+Description=changed system tuning changelog daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/changedd --system
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

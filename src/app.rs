@@ -1,6 +1,7 @@
 use crate::category::Category;
 use crate::config::{Config, DiffMode, PathKind, RedactionMode, RetentionPolicy, TrackSource, TrackedPackage, TrackedPath};
 use crate::journal::{EventKind, JournalEvent};
+use crate::scope::Scope;
 use anyhow::{anyhow, Context, Result};
 use directories::BaseDirs;
 use notify::{recommended_watcher, RecommendedWatcher, RecursiveMode, Watcher};
@@ -12,6 +13,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Write as _};
+use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::OnceLock;
@@ -22,34 +24,52 @@ use time::{Date, OffsetDateTime, Time};
 use walkdir::WalkDir;
 
 const APP_NAME: &str = "changed";
-const CONFIG_ENV: &str = "CHANGED_CONFIG_HOME";
-const STATE_ENV: &str = "CHANGED_STATE_HOME";
+const USER_CONFIG_ENV: &str = "CHANGED_CONFIG_HOME";
+const USER_STATE_ENV: &str = "CHANGED_STATE_HOME";
+const SYSTEM_CONFIG_ENV: &str = "CHANGED_SYSTEM_CONFIG_HOME";
+const SYSTEM_STATE_ENV: &str = "CHANGED_SYSTEM_STATE_HOME";
 const MAX_DIFF_BYTES: u64 = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
+    pub scope: Scope,
     pub config_home: PathBuf,
     pub state_home: PathBuf,
 }
 
 impl AppPaths {
-    pub fn detect() -> Result<Self> {
+    pub fn detect(scope: Scope) -> Result<Self> {
         let base_dirs = BaseDirs::new().context("failed to detect base directories")?;
 
-        let config_home = env::var_os(CONFIG_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| base_dirs.config_dir().join(APP_NAME));
-        let state_home = env::var_os(STATE_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                base_dirs
-                    .state_dir()
-                    .unwrap_or_else(|| base_dirs.home_dir())
-                    .join(".local/state")
-                    .join(APP_NAME)
-            });
+        let (config_home, state_home) = match scope {
+            Scope::User => {
+                let config_home = env::var_os(USER_CONFIG_ENV)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| base_dirs.config_dir().join(APP_NAME));
+                let state_home = env::var_os(USER_STATE_ENV)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        base_dirs
+                            .state_dir()
+                            .unwrap_or_else(|| base_dirs.home_dir())
+                            .join(".local/state")
+                            .join(APP_NAME)
+                    });
+                (config_home, state_home)
+            }
+            Scope::System => {
+                let config_home = env::var_os(SYSTEM_CONFIG_ENV)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/etc/changed"));
+                let state_home = env::var_os(SYSTEM_STATE_ENV)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/var/lib/changed"));
+                (config_home, state_home)
+            }
+        };
 
         Ok(Self {
+            scope,
             config_home,
             state_home,
         })
@@ -70,7 +90,8 @@ impl AppPaths {
 
 #[derive(Clone, Debug)]
 pub struct App {
-    pub paths: AppPaths,
+    pub user_paths: AppPaths,
+    pub system_paths: AppPaths,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +102,7 @@ pub struct DaemonOptions {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct ObservedPath {
+    scope: Scope,
     path: String,
     category: Category,
     diff_mode: DiffMode,
@@ -95,89 +117,139 @@ struct DaemonState {
     observed: BTreeMap<String, ObservedPath>,
 }
 
+pub struct HistoryQuery<'a> {
+    pub scopes: &'a [Scope],
+    pub include: &'a [Category],
+    pub exclude: &'a [Category],
+    pub path: Option<&'a Path>,
+    pub all: bool,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub clean: bool,
+}
+
 impl App {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            paths: AppPaths::detect()?,
+            user_paths: AppPaths::detect(Scope::User)?,
+            system_paths: AppPaths::detect(Scope::System)?,
         })
     }
 
-    pub fn init(&self) -> Result<String> {
-        fs::create_dir_all(&self.paths.config_home).context("failed to create config directory")?;
-        fs::create_dir_all(&self.paths.state_home).context("failed to create state directory")?;
+    fn paths_for_scope(&self, scope: Scope) -> &AppPaths {
+        match scope {
+            Scope::System => &self.system_paths,
+            Scope::User => &self.user_paths,
+        }
+    }
 
-        let config_path = self.paths.config_file();
+    pub fn init(&self, scope: Scope) -> Result<String> {
+        let paths = self.paths_for_scope(scope);
+        ensure_scope_directories(paths)?;
+
+        let config_path = paths.config_file();
         if config_path.exists() {
-            let config = self.load_config()?;
-            return Ok(render_init_summary(&self.paths, &config, false));
+            let config = self.load_config(scope)?;
+            return Ok(render_init_summary(paths, &config, false));
         }
 
         let mut config = Config::new();
-        config.tracked_paths = detect_presets()?;
+        config.tracked_paths = detect_presets(scope)?;
         config.sort_and_dedup();
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
-        Ok(render_init_summary(&self.paths, &config, true))
+        Ok(render_init_summary(paths, &config, true))
     }
 
-    pub fn list_tracked(&self, category: Option<Category>, path: Option<&Path>) -> Result<String> {
-        let config = self.load_or_default()?;
-        Ok(render_tracked(&config, category, path))
-    }
-
-    pub fn list_history(
+    pub fn list_tracked(
         &self,
-        category: Option<Category>,
+        scopes: &[Scope],
+        include: &[Category],
+        exclude: &[Category],
         path: Option<&Path>,
-        all: bool,
-        since: Option<&str>,
-        until: Option<&str>,
-        clean: bool,
     ) -> Result<String> {
-        let journal_exists = self.paths.journal_file().exists();
-        let since = parse_filter_time(since)?;
-        let until = parse_filter_time(until)?;
-        let limit = if all { None } else { Some(50) };
-        let events = self.load_filtered_events(category, path, since, until, limit)?;
+        let mut scoped_configs = Vec::new();
+        let path_filter = path.map(normalize_display_path);
+        let filters = CategoryFilters::new(include, exclude);
+
+        for &scope in scopes {
+            let config = self.load_or_default(scope)?;
+            if config.tracked_paths.is_empty() && config.tracked_packages.is_empty() {
+                continue;
+            }
+            scoped_configs.push((scope, config));
+        }
+
+        Ok(render_tracked(&scoped_configs, filters, path_filter.as_deref()))
+    }
+
+    pub fn list_history(&self, query: HistoryQuery<'_>) -> Result<String> {
+        let filters = CategoryFilters::new(query.include, query.exclude);
+        let since = parse_filter_time(query.since)?;
+        let until = parse_filter_time(query.until)?;
+        let limit = if query.all { None } else { Some(50) };
+        let path_filter = query.path.map(normalize_display_path);
+
+        let mut events = Vec::new();
+        let mut any_journal = false;
+        for &scope in query.scopes {
+            let paths = self.paths_for_scope(scope);
+            any_journal |= paths.journal_file().exists();
+            events.extend(self.load_filtered_events(
+                scope,
+                filters,
+                path_filter.as_deref(),
+                since,
+                until,
+                None,
+            )?);
+        }
+
+        events.sort_by_key(|event| event.timestamp);
+        if let Some(max) = limit && events.len() > max {
+            events = events.split_off(events.len() - max);
+        }
+
         if events.is_empty() {
-            return Ok(if journal_exists {
+            return Ok(if any_journal {
                 String::from("No change history matched that filter.")
             } else {
                 String::from("No change history recorded yet.")
             });
         }
-        Ok(render_history(&events, clean, None))
+        Ok(render_history(&events, query.clean, None))
     }
 
-    pub fn run_daemon(&self, options: DaemonOptions) -> Result<String> {
-        fs::create_dir_all(&self.paths.state_home).context("failed to create state directory")?;
-        let mut config = self.load_or_default()?;
+    pub fn run_daemon(&self, scope: Scope, options: DaemonOptions) -> Result<String> {
+        let paths = self.paths_for_scope(scope);
+        ensure_scope_directories(paths)?;
+        let mut config = self.load_or_default(scope)?;
         if config.tracked_paths.is_empty() {
             return Ok(String::from(
                 "Nothing is currently tracked. Add paths or categories before starting the daemon.",
             ));
         }
 
-        let had_existing_state = self.paths.daemon_state_file().exists();
-        let mut state = self.load_daemon_state()?;
+        let had_existing_state = paths.daemon_state_file().exists();
+        let mut state = self.load_daemon_state(scope)?;
         let mut runs = 0usize;
         let mut watcher = if options.once {
             None
         } else {
-            Some(build_watcher(&config, &self.paths)?)
+            Some(build_watcher(scope, &config, paths)?)
         };
 
         loop {
             if runs > 0 {
-                match self.load_or_default() {
+                match self.load_or_default(scope) {
                     Ok(latest) if latest != config => {
                         config = latest;
-                        let reloaded_observed = observe_tracked_paths(&config)?;
+                        let reloaded_observed = observe_tracked_paths(scope, &config)?;
                         state.observed = merge_reloaded_observed(&state.observed, reloaded_observed);
                         watcher = if options.once {
                             None
                         } else {
-                            Some(build_watcher(&config, &self.paths)?)
+                            Some(build_watcher(scope, &config, paths)?)
                         };
                         println!("Reloaded config. Watching {} tracked target(s)...", config.tracked_paths.len());
                     }
@@ -188,18 +260,18 @@ impl App {
                 }
             }
 
-            let observed = observe_tracked_paths(&config)?;
+            let observed = observe_tracked_paths(scope, &config)?;
             let events = if had_existing_state || !state.observed.is_empty() {
                 diff_observed(&state.observed, &observed)
             } else {
                 Vec::new()
             };
             if !events.is_empty() {
-                self.append_events(&events)?;
-                self.enforce_journal_retention(&config.retention)?;
+                self.append_events(scope, &events)?;
+                self.enforce_journal_retention(scope, &config.retention)?;
             }
             state.observed = observed;
-            self.save_daemon_state(&state)?;
+            self.save_daemon_state(scope, &state)?;
 
             runs += 1;
             if options.once {
@@ -222,9 +294,9 @@ impl App {
         }
     }
 
-    pub fn track_file(&self, raw_path: &str) -> Result<String> {
-        let mut config = self.load_or_default()?;
-        let expanded = expand_user_path(raw_path)?;
+    pub fn track_file(&self, scope: Scope, raw_path: &str) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
+        let expanded = expand_path(raw_path)?;
         let kind = detect_path_kind(&expanded);
         let path = normalize_display_path(&expanded);
         let category = infer_category_for_path(&expanded);
@@ -242,24 +314,26 @@ impl App {
                 source: TrackSource::Manual,
             },
         );
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
         Ok(format!(
-            "Now tracking {} under '{}' ({}, redaction {}).",
+            "Now tracking {} in {} scope under '{}' ({}, redaction {}).",
             path,
+            scope,
             category,
             diff_mode_label(diff_mode),
             redaction_label(redaction)
         ))
     }
 
-    pub fn track_category(&self, category: Category) -> Result<String> {
-        let mut config = self.load_or_default()?;
-        let preset_targets = preset_targets_for_category(category)?;
+    pub fn track_category(&self, scope: Scope, category: Category) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
+        let preset_targets = preset_targets_for_category(scope, category)?;
         if preset_targets.is_empty() {
             return Ok(format!(
-                "No matching preset paths were found for '{}' on this system.",
+                "No matching preset paths were found for '{}' in {} scope.",
                 category
+                ,scope
             ));
         }
 
@@ -267,72 +341,79 @@ impl App {
         for target in preset_targets {
             upsert_path(&mut config, target);
         }
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
         let added = config.tracked_paths.len().saturating_sub(count_before);
         Ok(format!(
-            "Tracked category '{}'. Added {} preset target{}.",
+            "Tracked category '{}' in {} scope. Added {} preset target{}.",
             category,
+            scope,
             added,
             pluralize(added)
         ))
     }
 
-    pub fn track_package(&self, manager: &str, package_name: &str) -> Result<String> {
-        let mut config = self.load_or_default()?;
+    pub fn track_package(&self, scope: Scope, manager: &str, package_name: &str) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
         config.tracked_packages.push(TrackedPackage {
             manager: manager.to_owned(),
             package_name: package_name.to_owned(),
             source: TrackSource::Manual,
         });
         config.sort_and_dedup();
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
-        Ok(format!("Now tracking package target: {} {}", manager, package_name))
+        Ok(format!(
+            "Now tracking package target in {} scope: {} {}",
+            scope, manager, package_name
+        ))
     }
 
-    pub fn untrack_file(&self, raw_path: &str) -> Result<String> {
-        let mut config = self.load_or_default()?;
-        let path = normalize_display_path(&expand_user_path(raw_path)?);
+    pub fn untrack_file(&self, scope: Scope, raw_path: &str) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
+        let path = normalize_display_path(&expand_path(raw_path)?);
         let before = config.tracked_paths.len();
         config.tracked_paths.retain(|entry| entry.path != path);
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
         let removed = before.saturating_sub(config.tracked_paths.len());
         Ok(format!(
-            "Stopped tracking {}. Removed {} target{}.",
+            "Stopped tracking {} in {} scope. Removed {} target{}.",
             path,
+            scope,
             removed,
             pluralize(removed)
         ))
     }
 
-    pub fn untrack_category(&self, category: Category) -> Result<String> {
-        let mut config = self.load_or_default()?;
+    pub fn untrack_category(&self, scope: Scope, category: Category) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
         let before = config.tracked_paths.len();
         config.tracked_paths.retain(|entry| entry.category != category);
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
         let removed = before.saturating_sub(config.tracked_paths.len());
         Ok(format!(
-            "Stopped tracking category '{}'. Removed {} target{}.",
+            "Stopped tracking category '{}' in {} scope. Removed {} target{}.",
             category,
+            scope,
             removed,
             pluralize(removed)
         ))
     }
 
-    pub fn untrack_package(&self, manager: &str, package_name: &str) -> Result<String> {
-        let mut config = self.load_or_default()?;
+    pub fn untrack_package(&self, scope: Scope, manager: &str, package_name: &str) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
         let before = config.tracked_packages.len();
         config
             .tracked_packages
             .retain(|pkg| !(pkg.manager == manager && pkg.package_name == package_name));
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
 
         let removed = before.saturating_sub(config.tracked_packages.len());
         Ok(format!(
-            "Stopped tracking package target: {} {}. Removed {} record{}.",
+            "Stopped tracking package target in {} scope: {} {}. Removed {} record{}.",
+            scope,
             manager,
             package_name,
             removed,
@@ -340,15 +421,16 @@ impl App {
         ))
     }
 
-    pub fn set_diff_mode(&self, raw_path: &str, diff_mode: DiffMode) -> Result<String> {
-        let mut config = self.load_or_default()?;
-        let path = normalize_display_path(&expand_user_path(raw_path)?);
+    pub fn set_diff_mode(&self, scope: Scope, raw_path: &str, diff_mode: DiffMode) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
+        let path = normalize_display_path(&expand_path(raw_path)?);
         let updated = set_path_policy(&mut config, &path, |entry| entry.diff_mode = diff_mode);
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
         if updated {
             Ok(format!(
-                "Updated diff mode for {} to {}.",
+                "Updated diff mode for {} in {} scope to {}.",
                 path,
+                scope,
                 diff_mode_label(diff_mode)
             ))
         } else {
@@ -356,15 +438,16 @@ impl App {
         }
     }
 
-    pub fn set_redaction_mode(&self, raw_path: &str, redaction: RedactionMode) -> Result<String> {
-        let mut config = self.load_or_default()?;
-        let path = normalize_display_path(&expand_user_path(raw_path)?);
+    pub fn set_redaction_mode(&self, scope: Scope, raw_path: &str, redaction: RedactionMode) -> Result<String> {
+        let mut config = self.load_or_default(scope)?;
+        let path = normalize_display_path(&expand_path(raw_path)?);
         let updated = set_path_policy(&mut config, &path, |entry| entry.redaction = redaction);
-        self.save_config(&config)?;
+        self.save_config(scope, &config)?;
         if updated {
             Ok(format!(
-                "Updated redaction mode for {} to {}.",
+                "Updated redaction mode for {} in {} scope to {}.",
                 path,
+                scope,
                 redaction_label(redaction)
             ))
         } else {
@@ -372,27 +455,31 @@ impl App {
         }
     }
 
-    pub fn service_message(&self, action: &str) -> String {
+    pub fn service_action(&self, action: &str, scope: Scope) -> Result<String> {
         match action {
-            "install" => String::from("Service installation is not implemented yet."),
-            "start" => String::from("Service start is not implemented yet."),
-            "stop" => String::from("Service stop is not implemented yet."),
-            "status" => String::from("Service status is not implemented yet."),
-            _ => String::from("Unknown service action."),
+            "install" => self.install_service(scope),
+            "start" => self.start_service(scope),
+            "stop" => self.stop_service(scope),
+            "status" => self.status_service(scope),
+            _ => Err(anyhow!("Unknown service action.")),
         }
     }
 
-    fn load_or_default(&self) -> Result<Config> {
-        let config_path = self.paths.config_file();
+    pub fn infer_scope_for_path(&self, raw_path: &str) -> Result<Option<Scope>> {
+        Ok(infer_scope_for_path(&expand_path(raw_path)?))
+    }
+
+    fn load_or_default(&self, scope: Scope) -> Result<Config> {
+        let config_path = self.paths_for_scope(scope).config_file();
         if config_path.exists() {
-            self.load_config()
+            self.load_config(scope)
         } else {
             Ok(Config::new())
         }
     }
 
-    fn load_config(&self) -> Result<Config> {
-        let path = self.paths.config_file();
+    fn load_config(&self, scope: Scope) -> Result<Config> {
+        let path = self.paths_for_scope(scope).config_file();
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
         let mut config: Config = toml::from_str(&contents)
@@ -404,28 +491,17 @@ impl App {
         Ok(config)
     }
 
-    fn save_config(&self, config: &Config) -> Result<()> {
-        fs::create_dir_all(&self.paths.config_home).context("failed to create config directory")?;
-        let path = self.paths.config_file();
+    fn save_config(&self, scope: Scope, config: &Config) -> Result<()> {
+        let paths = self.paths_for_scope(scope);
+        ensure_scope_directories(paths)?;
+        let path = paths.config_file();
         let contents = toml::to_string_pretty(config).context("failed to serialize config")?;
-        let temp_path = path.with_extension(format!(
-            "toml.tmp.{}",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        fs::write(&temp_path, contents)
-            .with_context(|| format!("failed to write temporary config file {}", temp_path.display()))?;
-        fs::rename(&temp_path, &path).with_context(|| {
-            format!(
-                "failed to replace config file {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
+        write_atomic(&path, "toml", contents.as_bytes(), scope)?;
         Ok(())
     }
 
-    fn load_daemon_state(&self) -> Result<DaemonState> {
-        let path = self.paths.daemon_state_file();
+    fn load_daemon_state(&self, scope: Scope) -> Result<DaemonState> {
+        let path = self.paths_for_scope(scope).daemon_state_file();
         if !path.exists() {
             return Ok(DaemonState::default());
         }
@@ -436,38 +512,25 @@ impl App {
         Ok(state)
     }
 
-    fn save_daemon_state(&self, state: &DaemonState) -> Result<()> {
-        fs::create_dir_all(&self.paths.state_home).context("failed to create state directory")?;
-        let path = self.paths.daemon_state_file();
+    fn save_daemon_state(&self, scope: Scope, state: &DaemonState) -> Result<()> {
+        let paths = self.paths_for_scope(scope);
+        ensure_scope_directories(paths)?;
+        let path = paths.daemon_state_file();
         let contents = serde_json::to_string_pretty(state).context("failed to serialize daemon state")?;
-        let temp_path = path.with_extension(format!(
-            "json.tmp.{}",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        fs::write(&temp_path, contents).with_context(|| {
-            format!(
-                "failed to write temporary daemon state {}",
-                temp_path.display()
-            )
-        })?;
-        fs::rename(&temp_path, &path).with_context(|| {
-            format!(
-                "failed to replace daemon state file {} with {}",
-                path.display(),
-                temp_path.display()
-            )
-        })?;
+        write_atomic(&path, "json", contents.as_bytes(), scope)?;
         Ok(())
     }
 
-    fn append_events(&self, events: &[JournalEvent]) -> Result<()> {
-        fs::create_dir_all(&self.paths.state_home).context("failed to create state directory")?;
-        let path = self.paths.journal_file();
+    fn append_events(&self, scope: Scope, events: &[JournalEvent]) -> Result<()> {
+        let paths = self.paths_for_scope(scope);
+        ensure_scope_directories(paths)?;
+        let path = paths.journal_file();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open journal {}", path.display()))?;
+        set_scope_file_permissions(&path, scope)?;
         for event in events {
             let line = serde_json::to_string(event).context("failed to serialize journal event")?;
             file.write_all(line.as_bytes()).context("failed to write journal event")?;
@@ -476,8 +539,8 @@ impl App {
         Ok(())
     }
 
-    fn load_events(&self) -> Result<Vec<JournalEvent>> {
-        let path = self.paths.journal_file();
+    fn load_events(&self, scope: Scope) -> Result<Vec<JournalEvent>> {
+        let path = self.paths_for_scope(scope).journal_file();
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -499,18 +562,18 @@ impl App {
 
     fn load_filtered_events(
         &self,
-        category: Option<Category>,
-        path: Option<&Path>,
+        scope: Scope,
+        filters: CategoryFilters<'_>,
+        path: Option<&str>,
         since: Option<OffsetDateTime>,
         until: Option<OffsetDateTime>,
         limit: Option<usize>,
     ) -> Result<Vec<JournalEvent>> {
-        let journal_path = self.paths.journal_file();
+        let journal_path = self.paths_for_scope(scope).journal_file();
         if !journal_path.exists() {
             return Ok(Vec::new());
         }
 
-        let path_filter = path.map(normalize_display_path);
         let file = fs::File::open(&journal_path)
             .with_context(|| format!("failed to read journal {}", journal_path.display()))?;
         let reader = BufReader::new(file);
@@ -527,7 +590,7 @@ impl App {
             }
             let event: JournalEvent = serde_json::from_str(&line)
                 .with_context(|| format!("failed to parse journal line in {}", journal_path.display()))?;
-            if !event_matches_filters(&event, category, path_filter.as_deref(), since, until) {
+            if !event_matches_filters(&event, filters, path, since, until) {
                 continue;
             }
 
@@ -550,15 +613,15 @@ impl App {
         }
     }
 
-    fn enforce_journal_retention(&self, retention: &RetentionPolicy) -> Result<()> {
-        let path = self.paths.journal_file();
+    fn enforce_journal_retention(&self, scope: Scope, retention: &RetentionPolicy) -> Result<()> {
+        let path = self.paths_for_scope(scope).journal_file();
         if !path.exists() {
             return Ok(());
         }
 
         let metadata = fs::metadata(&path)
             .with_context(|| format!("failed to read journal metadata {}", path.display()))?;
-        let events = self.load_events()?;
+        let events = self.load_events(scope)?;
         let exceeds_events = events.len() > retention.max_events;
         let exceeds_bytes = metadata.len() > retention.max_bytes;
         if !exceeds_events && !exceeds_bytes {
@@ -577,6 +640,48 @@ impl App {
                 .context("failed to write retained journal newline")?;
         }
         Ok(())
+    }
+
+    fn install_service(&self, scope: Scope) -> Result<String> {
+        let unit_path = service_unit_install_path(scope)?;
+        let unit_dir = unit_path
+            .parent()
+            .context("service unit path is missing a parent directory")?;
+        fs::create_dir_all(unit_dir)
+            .with_context(|| format!("failed to create unit directory {}", unit_dir.display()))?;
+
+        let daemon_path = daemon_binary_path()?;
+        let contents = render_systemd_unit(scope, &daemon_path);
+        write_atomic_with_mode(&unit_path, "service", contents.as_bytes(), 0o644)?;
+
+        run_systemctl(scope, ["daemon-reload"])?;
+
+        Ok(format!(
+            "Installed {} service unit at {}.\nRun `{} changedd` or `changed service start {}` next.",
+            scope,
+            unit_path.display(),
+            if scope == Scope::System {
+                "sudo systemctl enable --now"
+            } else {
+                "systemctl --user enable --now"
+            },
+            if scope == Scope::System { "-S" } else { "-U" }
+        ))
+    }
+
+    fn start_service(&self, scope: Scope) -> Result<String> {
+        run_systemctl(scope, ["daemon-reload"])?;
+        run_systemctl(scope, ["enable", "--now", systemd_unit_name()])?;
+        Ok(format!("Started and enabled {} service.", scope))
+    }
+
+    fn stop_service(&self, scope: Scope) -> Result<String> {
+        run_systemctl(scope, ["disable", "--now", systemd_unit_name()])?;
+        Ok(format!("Stopped and disabled {} service.", scope))
+    }
+
+    fn status_service(&self, scope: Scope) -> Result<String> {
+        run_systemctl(scope, ["status", systemd_unit_name(), "--no-pager", "--full"])
     }
 }
 
@@ -613,65 +718,94 @@ fn render_init_summary(paths: &AppPaths, config: &Config, created: bool) -> Stri
     out
 }
 
-fn render_tracked(config: &Config, category: Option<Category>, path: Option<&Path>) -> String {
+#[derive(Clone, Copy)]
+struct CategoryFilters<'a> {
+    include: &'a [Category],
+    exclude: &'a [Category],
+}
+
+impl<'a> CategoryFilters<'a> {
+    fn new(include: &'a [Category], exclude: &'a [Category]) -> Self {
+        Self { include, exclude }
+    }
+
+    fn matches(self, category: Category) -> bool {
+        let included = self.include.is_empty() || self.include.contains(&category);
+        let excluded = self.exclude.contains(&category);
+        included && !excluded
+    }
+}
+
+fn render_tracked(
+    scoped_configs: &[(Scope, Config)],
+    filters: CategoryFilters<'_>,
+    path: Option<&str>,
+) -> String {
     let mut out = String::new();
-    let path_filter = path.map(normalize_display_path);
-
-    let filtered_paths: Vec<&TrackedPath> = config
-        .tracked_paths
-        .iter()
-        .filter(|entry| category.is_none_or(|wanted| entry.category == wanted))
-        .filter(|entry| {
-            path_filter
-                .as_ref()
-                .is_none_or(|wanted| entry.path.as_str() == wanted.as_str())
-        })
-        .collect();
-
-    let filtered_packages: Vec<&TrackedPackage> = config
-        .tracked_packages
-        .iter()
-        .filter(|_| category.is_none_or(|wanted| wanted == Category::Packages))
-        .collect();
-
-    if filtered_paths.is_empty() && filtered_packages.is_empty() {
+    if scoped_configs.is_empty() {
         return String::from("Nothing is currently tracked for that filter.");
     }
 
-    for current in Category::ALL {
-        if category.is_some_and(|wanted| wanted != current) {
+    let mut wrote_any = false;
+    for (scope, config) in scoped_configs {
+        let filtered_paths: Vec<&TrackedPath> = config
+            .tracked_paths
+            .iter()
+            .filter(|entry| filters.matches(entry.category))
+            .filter(|entry| path.is_none_or(|wanted| entry.path.as_str() == wanted))
+            .collect();
+
+        let filtered_packages: Vec<&TrackedPackage> = config
+            .tracked_packages
+            .iter()
+            .filter(|_| filters.matches(Category::Packages))
+            .collect();
+
+        if filtered_paths.is_empty() && filtered_packages.is_empty() {
             continue;
         }
 
-        let section_paths: Vec<&TrackedPath> = filtered_paths
-            .iter()
-            .copied()
-            .filter(|entry| entry.category == current)
-            .collect();
-        let section_packages: Vec<&TrackedPackage> = filtered_packages
-            .iter()
-            .copied()
-            .filter(|_| current == Category::Packages)
-            .collect();
+        if wrote_any {
+            out.push('\n');
+        }
+        wrote_any = true;
+        let _ = writeln!(out, "{}:", scope);
 
-        if section_paths.is_empty() && section_packages.is_empty() {
-            continue;
-        }
+        for current in Category::ALL {
+            let section_paths: Vec<&TrackedPath> = filtered_paths
+                .iter()
+                .copied()
+                .filter(|entry| entry.category == current)
+                .collect();
+            let section_packages: Vec<&TrackedPackage> = filtered_packages
+                .iter()
+                .copied()
+                .filter(|_| current == Category::Packages)
+                .collect();
 
-        let _ = writeln!(out, "{}:", current);
-        for entry in section_paths {
-            let _ = writeln!(
-                out,
-                "  - {} [{}; {}; {}]",
-                entry.path,
-                kind_label(entry.kind),
-                diff_mode_label(entry.diff_mode),
-                redaction_label(entry.redaction)
-            );
+            if section_paths.is_empty() && section_packages.is_empty() {
+                continue;
+            }
+
+            let _ = writeln!(out, "  {}:", current);
+            for entry in section_paths {
+                let _ = writeln!(
+                    out,
+                    "    - {} [{}; {}; {}]",
+                    entry.path,
+                    kind_label(entry.kind),
+                    diff_mode_label(entry.diff_mode),
+                    redaction_label(entry.redaction)
+                );
+            }
+            for pkg in section_packages {
+                let _ = writeln!(out, "    - {} {}", pkg.manager, pkg.package_name);
+            }
         }
-        for pkg in section_packages {
-            let _ = writeln!(out, "  - {} {}", pkg.manager, pkg.package_name);
-        }
+    }
+
+    if !wrote_any {
+        return String::from("Nothing is currently tracked for that filter.");
     }
 
     out.trim_end().to_owned()
@@ -700,13 +834,15 @@ fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>) ->
         if clean {
             let _ = writeln!(
                 out,
-                "- {} [{}] {}",
+                "- {} [{}/{}] {}",
                 format_time(event.timestamp.time()),
+                event.scope,
                 event.category,
                 clean_summary(event)
             );
         } else {
             let _ = writeln!(out, "### {}", format_time(event.timestamp.time()));
+            let _ = writeln!(out, "Scope: {}", event.scope);
             let _ = writeln!(out, "{}", event.path);
             let _ = writeln!(out, "{}", event.summary);
             if let Some(diff) = &event.diff {
@@ -721,20 +857,21 @@ fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>) ->
     out.trim_end().to_owned()
 }
 
-fn observe_tracked_paths(config: &Config) -> Result<BTreeMap<String, ObservedPath>> {
+fn observe_tracked_paths(scope: Scope, config: &Config) -> Result<BTreeMap<String, ObservedPath>> {
     let mut observed = BTreeMap::new();
     for tracked in &config.tracked_paths {
-        for candidate in expand_tracked_target(tracked)? {
+        for candidate in expand_tracked_target(scope, tracked)? {
             observed.insert(candidate.path.clone(), candidate);
         }
     }
     Ok(observed)
 }
 
-fn expand_tracked_target(tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
+fn expand_tracked_target(scope: Scope, tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
     let path = PathBuf::from(&tracked.path);
     match tracked.kind {
         PathKind::File => Ok(vec![observe_single_path(
+            scope,
             path,
             tracked.category,
             tracked.diff_mode,
@@ -743,6 +880,7 @@ fn expand_tracked_target(tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
         PathKind::Directory => {
             if !path.exists() {
                 return Ok(vec![observe_single_path(
+                    scope,
                     path,
                     tracked.category,
                     tracked.diff_mode,
@@ -756,6 +894,7 @@ fn expand_tracked_target(tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
                     continue;
                 }
                 entries.push(observe_single_path(
+                    scope,
                     entry.path().to_path_buf(),
                     tracked.category,
                     tracked.diff_mode,
@@ -764,6 +903,7 @@ fn expand_tracked_target(tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
             }
             if entries.is_empty() {
                 entries.push(observe_single_path(
+                    scope,
                     path,
                     tracked.category,
                     tracked.diff_mode,
@@ -776,6 +916,7 @@ fn expand_tracked_target(tracked: &TrackedPath) -> Result<Vec<ObservedPath>> {
 }
 
 fn observe_single_path(
+    scope: Scope,
     path: PathBuf,
     category: Category,
     diff_mode: DiffMode,
@@ -784,6 +925,7 @@ fn observe_single_path(
     let display = normalize_display_path(&path);
     if !path.exists() {
         return Ok(ObservedPath {
+            scope,
             path: display,
             category,
             diff_mode,
@@ -802,6 +944,7 @@ fn observe_single_path(
         hasher.update(display.as_bytes());
         hasher.update(format!("{modified:?}").as_bytes());
         return Ok(ObservedPath {
+            scope,
             path: display,
             category,
             diff_mode,
@@ -823,6 +966,7 @@ fn observe_single_path(
     };
 
     Ok(ObservedPath {
+        scope,
         path: display,
         category,
         diff_mode,
@@ -878,6 +1022,7 @@ fn build_event(
     let (added_lines, removed_lines) = diff_line_counts(diff.as_deref());
     JournalEvent {
         timestamp: OffsetDateTime::now_utc(),
+        scope: reference.scope,
         kind: kind.clone(),
         category: reference.category,
         path: reference.path.clone(),
@@ -992,12 +1137,12 @@ fn merge_reloaded_observed(
 
 fn event_matches_filters(
     event: &JournalEvent,
-    category: Option<Category>,
+    filters: CategoryFilters<'_>,
     path: Option<&str>,
     since: Option<OffsetDateTime>,
     until: Option<OffsetDateTime>,
 ) -> bool {
-    category.is_none_or(|wanted| event.category == wanted)
+    filters.matches(event.category)
         && path.is_none_or(|wanted| wanted == event.path)
         && since.is_none_or(|value| event.timestamp >= value)
         && until.is_none_or(|value| event.timestamp <= value)
@@ -1089,19 +1234,19 @@ fn upsert_path(config: &mut Config, path: TrackedPath) {
     config.sort_and_dedup();
 }
 
-fn detect_presets() -> Result<Vec<TrackedPath>> {
+fn detect_presets(scope: Scope) -> Result<Vec<TrackedPath>> {
     let mut all = Vec::new();
     for category in Category::ALL {
         if category == Category::Packages {
             continue;
         }
-        all.extend(preset_targets_for_category(category)?);
+        all.extend(preset_targets_for_category(scope, category)?);
     }
     Ok(all)
 }
 
-fn preset_targets_for_category(category: Category) -> Result<Vec<TrackedPath>> {
-    let home = home_dir()?;
+fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<TrackedPath>> {
+    let home = home_dir().ok();
     let profile = HardwareProfile::detect();
 
     let candidates = match category {
@@ -1128,20 +1273,55 @@ fn preset_targets_for_category(category: Category) -> Result<Vec<TrackedPath>> {
         ],
         Category::Services => vec![
             Some(preset_file("/etc/systemd/system.conf", category, DiffMode::Unified, RedactionMode::Off)),
-            Some(preset_dir(home.join(".config/systemd/user"), category, DiffMode::MetadataOnly, RedactionMode::Off)),
+            home.as_ref().map(|home| {
+                preset_dir(
+                    home.join(".config/systemd/user"),
+                    category,
+                    DiffMode::MetadataOnly,
+                    RedactionMode::Off,
+                )
+            }),
         ],
         Category::Scheduler => vec![
             Some(preset_file("/etc/sysctl.d/99-scheduler.conf", category, DiffMode::Unified, RedactionMode::Off)),
             Some(preset_file("/etc/udev/rules.d/60-ioschedulers.rules", category, DiffMode::Unified, RedactionMode::Off)),
         ],
         Category::Shell => vec![
-            Some(preset_file(home.join(".config/fish/config.fish"), category, DiffMode::MetadataOnly, RedactionMode::Auto)),
-            Some(preset_file(home.join(".bashrc"), category, DiffMode::MetadataOnly, RedactionMode::Auto)),
-            Some(preset_file(home.join(".zshrc"), category, DiffMode::MetadataOnly, RedactionMode::Auto)),
+            home.as_ref().map(|home| {
+                preset_file(
+                    home.join(".config/fish/config.fish"),
+                    category,
+                    DiffMode::MetadataOnly,
+                    RedactionMode::Auto,
+                )
+            }),
+            home.as_ref().map(|home| {
+                preset_file(
+                    home.join(".bashrc"),
+                    category,
+                    DiffMode::MetadataOnly,
+                    RedactionMode::Auto,
+                )
+            }),
+            home.as_ref().map(|home| {
+                preset_file(
+                    home.join(".zshrc"),
+                    category,
+                    DiffMode::MetadataOnly,
+                    RedactionMode::Auto,
+                )
+            }),
         ],
         Category::Build => vec![
             Some(preset_file("/etc/makepkg.conf", category, DiffMode::Unified, RedactionMode::Off)),
-            Some(preset_file(home.join(".config/pacman/makepkg.conf"), category, DiffMode::Unified, RedactionMode::Off)),
+            home.as_ref().map(|home| {
+                preset_file(
+                    home.join(".config/pacman/makepkg.conf"),
+                    category,
+                    DiffMode::Unified,
+                    RedactionMode::Off,
+                )
+            }),
         ],
         Category::Boot => vec![
             Some(preset_file("/etc/default/grub", category, DiffMode::Unified, RedactionMode::Off)),
@@ -1149,8 +1329,22 @@ fn preset_targets_for_category(category: Category) -> Result<Vec<TrackedPath>> {
             Some(preset_dir("/boot/loader/entries", category, DiffMode::MetadataOnly, RedactionMode::Off)),
         ],
         Category::Audio => vec![
-            Some(preset_file(home.join(".config/pipewire/pipewire.conf"), category, DiffMode::Unified, RedactionMode::Off)),
-            Some(preset_dir(home.join(".config/wireplumber/wireplumber.conf.d"), category, DiffMode::MetadataOnly, RedactionMode::Off)),
+            home.as_ref().map(|home| {
+                preset_file(
+                    home.join(".config/pipewire/pipewire.conf"),
+                    category,
+                    DiffMode::Unified,
+                    RedactionMode::Off,
+                )
+            }),
+            home.as_ref().map(|home| {
+                preset_dir(
+                    home.join(".config/wireplumber/wireplumber.conf.d"),
+                    category,
+                    DiffMode::MetadataOnly,
+                    RedactionMode::Off,
+                )
+            }),
             Some(preset_file("/etc/pipewire/pipewire.conf", category, DiffMode::Unified, RedactionMode::Off)),
         ],
         Category::Packages => Vec::new(),
@@ -1159,6 +1353,7 @@ fn preset_targets_for_category(category: Category) -> Result<Vec<TrackedPath>> {
     Ok(candidates
         .into_iter()
         .flatten()
+        .filter(|entry| entry_scope(Path::new(&entry.path)).is_some_and(|entry_scope| entry_scope == scope))
         .filter(|entry| Path::new(&entry.path).exists())
         .collect())
 }
@@ -1322,7 +1517,7 @@ struct ActiveWatcher {
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
 }
 
-fn build_watcher(config: &Config, paths: &AppPaths) -> Result<ActiveWatcher> {
+fn build_watcher(_scope: Scope, config: &Config, paths: &AppPaths) -> Result<ActiveWatcher> {
     let (tx, rx) = mpsc::channel();
     let mut watcher = recommended_watcher(move |event| {
         let _ = tx.send(event);
@@ -1511,7 +1706,7 @@ fn normalize_display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn expand_user_path(raw_path: &str) -> Result<PathBuf> {
+fn expand_path(raw_path: &str) -> Result<PathBuf> {
     if raw_path == "~" {
         return home_dir();
     }
@@ -1527,6 +1722,208 @@ fn expand_user_path(raw_path: &str) -> Result<PathBuf> {
             .context("failed to detect current directory")?
             .join(path))
     }
+}
+
+fn infer_scope_for_path(path: &Path) -> Option<Scope> {
+    entry_scope(path)
+}
+
+fn entry_scope(path: &Path) -> Option<Scope> {
+    let normalized = normalize_display_path(path);
+    let home = home_dir().ok()?;
+    let home_display = normalize_display_path(&home);
+
+    if normalized == home_display || normalized.starts_with(&format!("{home_display}/")) {
+        Some(Scope::User)
+    } else if path.is_absolute() {
+        Some(Scope::System)
+    } else {
+        None
+    }
+}
+
+fn ensure_scope_directories(paths: &AppPaths) -> Result<()> {
+    fs::create_dir_all(&paths.config_home)
+        .with_context(|| format!("failed to create config directory {}", paths.config_home.display()))?;
+    fs::create_dir_all(&paths.state_home)
+        .with_context(|| format!("failed to create state directory {}", paths.state_home.display()))?;
+    set_scope_dir_permissions(&paths.config_home, paths.scope)?;
+    set_scope_dir_permissions(&paths.state_home, paths.scope)?;
+    Ok(())
+}
+
+fn write_atomic(path: &Path, extension: &str, contents: &[u8], scope: Scope) -> Result<()> {
+    let temp_path = path.with_extension(format!(
+        "{extension}.tmp.{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    fs::write(&temp_path, contents)
+        .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
+    set_scope_file_permissions(&temp_path, scope)?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    set_scope_file_permissions(path, scope)?;
+    Ok(())
+}
+
+fn write_atomic_with_mode(path: &Path, extension: &str, contents: &[u8], mode: u32) -> Result<()> {
+    let temp_path = path.with_extension(format!(
+        "{extension}.tmp.{}",
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    fs::write(&temp_path, contents)
+        .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
+    set_mode(&temp_path, mode)?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    set_mode(path, mode)?;
+    Ok(())
+}
+
+fn daemon_binary_path() -> Result<PathBuf> {
+    let current = env::current_exe().context("failed to detect current executable")?;
+    let file_name = current
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let candidate = if file_name == "changedd" {
+        current.clone()
+    } else {
+        current.with_file_name("changedd")
+    };
+
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        Err(anyhow!(
+            "failed to find changedd next to {}",
+            current.display()
+        ))
+    }
+}
+
+fn render_systemd_unit(scope: Scope, daemon_path: &Path) -> String {
+    let (after_target, wanted_by, scope_flag, description) = match scope {
+        Scope::System => (
+            "network.target",
+            "multi-user.target",
+            "--system",
+            "changed system tuning changelog daemon",
+        ),
+        Scope::User => (
+            "default.target",
+            "default.target",
+            "--user",
+            "changed user tuning changelog daemon",
+        ),
+    };
+
+    format!(
+        "[Unit]\nDescription={description}\nAfter={after_target}\n\n[Service]\nType=simple\nExecStart={} {}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=yes\nPrivateTmp=yes\n\n[Install]\nWantedBy={wanted_by}\n",
+        daemon_path.display(),
+        scope_flag
+    )
+}
+
+fn service_unit_install_path(scope: Scope) -> Result<PathBuf> {
+    match scope {
+        Scope::System => Ok(PathBuf::from("/etc/systemd/system").join(systemd_unit_name())),
+        Scope::User => Ok(home_dir()?
+            .join(".config/systemd/user")
+            .join(systemd_unit_name())),
+    }
+}
+
+fn systemd_unit_name() -> &'static str {
+    "changedd.service"
+}
+
+fn run_systemctl<I, S>(scope: Scope, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut command = Command::new("systemctl");
+    if scope == Scope::User {
+        command.arg("--user");
+    }
+    for arg in args {
+        command.arg(arg.as_ref());
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run systemctl for {} scope", scope))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+
+    if output.status.success() {
+        Ok(if stdout.is_empty() {
+            format!("systemctl completed for {} scope.", scope)
+        } else {
+            stdout
+        })
+    } else if stderr.is_empty() {
+        Err(anyhow!(
+            "systemctl failed for {} scope with status {}",
+            scope,
+            output.status
+        ))
+    } else {
+        Err(anyhow!(stderr))
+    }
+}
+
+#[cfg(unix)]
+fn set_scope_dir_permissions(path: &Path, scope: Scope) -> Result<()> {
+    let mode = match scope {
+        Scope::System => 0o700,
+        Scope::User => 0o700,
+    };
+    set_mode(path, mode)
+}
+
+#[cfg(not(unix))]
+fn set_scope_dir_permissions(_path: &Path, _scope: Scope) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_scope_file_permissions(path: &Path, scope: Scope) -> Result<()> {
+    let mode = match scope {
+        Scope::System => 0o600,
+        Scope::User => 0o600,
+    };
+    set_mode(path, mode)
+}
+
+#[cfg(not(unix))]
+fn set_scope_file_permissions(_path: &Path, _scope: Scope) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -1601,12 +1998,16 @@ mod tests {
         }
 
         fn app(&self) -> App {
-            let config_home = self.root.join("config");
-            let state_home = self.root.join("state");
             App {
-                paths: AppPaths {
-                    config_home,
-                    state_home,
+                user_paths: AppPaths {
+                    scope: Scope::User,
+                    config_home: self.root.join("user-config"),
+                    state_home: self.root.join("user-state"),
+                },
+                system_paths: AppPaths {
+                    scope: Scope::System,
+                    config_home: self.root.join("system-config"),
+                    state_home: self.root.join("system-state"),
                 },
             }
         }
@@ -1623,12 +2024,33 @@ mod tests {
         let env = TestEnv::new();
         let app = env.app();
 
-        app.track_file("/etc/makepkg.conf").expect("tracking should succeed");
-        let config = app.load_config().expect("config should load");
+        app.track_file(Scope::System, "/etc/makepkg.conf")
+            .expect("tracking should succeed");
+        let config = app.load_config(Scope::System).expect("config should load");
 
         assert_eq!(config.tracked_paths.len(), 1);
         assert_eq!(config.tracked_paths[0].category, Category::Build);
         assert_eq!(config.tracked_paths[0].diff_mode, DiffMode::Unified);
+    }
+
+    #[test]
+    fn infer_scope_for_path_distinguishes_home_and_system_paths() {
+        let env = TestEnv::new();
+        let app = env.app();
+        let user_path = home_dir()
+            .expect("home should exist")
+            .join(".config/changed-test/config.fish");
+
+        assert_eq!(
+            app.infer_scope_for_path(user_path.to_string_lossy().as_ref())
+                .expect("inference should succeed"),
+            Some(Scope::User)
+        );
+        assert_eq!(
+            app.infer_scope_for_path("/etc/makepkg.conf")
+                .expect("inference should succeed"),
+            Some(Scope::System)
+        );
     }
 
     #[test]
@@ -1642,13 +2064,167 @@ mod tests {
             fs::write(&fish_config, "# test\n").expect("fish config should be writable");
         }
 
-        app.track_category(Category::Shell)
+        app.track_category(Scope::User, Category::Shell)
             .expect("category tracking should succeed");
-        let config = app.load_config().expect("config should load");
+        let config = app.load_config(Scope::User).expect("config should load");
         assert!(config
             .tracked_paths
             .iter()
             .any(|entry| entry.category == Category::Shell));
+    }
+
+    #[test]
+    fn tracked_listing_filters_include_and_exclude_categories() {
+        let env = TestEnv::new();
+        let app = env.app();
+        let user_file = home_dir()
+            .expect("home should exist")
+            .join(".config/fish/config.fish");
+
+        app.track_file(Scope::System, "/etc/makepkg.conf")
+            .expect("system tracking should succeed");
+        app.track_file(Scope::User, user_file.to_string_lossy().as_ref())
+            .expect("user tracking should succeed");
+
+        let output = app
+            .list_tracked(
+                &[Scope::System, Scope::User],
+                &[Category::Build, Category::Shell],
+                &[Category::Build],
+                None,
+            )
+            .expect("tracked listing should succeed");
+
+        assert!(output.contains("user:"));
+        assert!(output.contains("shell:"));
+        assert!(!output.contains("build:"));
+        assert!(!output.contains("/etc/makepkg.conf"));
+    }
+
+    #[test]
+    fn merged_history_includes_user_and_system_scopes_in_time_order() {
+        let env = TestEnv::new();
+        let app = env.app();
+
+        app.append_events(
+            Scope::System,
+            &[JournalEvent {
+                timestamp: OffsetDateTime::parse("2026-04-03T10:00:00Z", &Rfc3339)
+                    .expect("timestamp should parse"),
+                scope: Scope::System,
+                kind: EventKind::Modified,
+                category: Category::Boot,
+                path: "/boot/loader/entries/arch.conf".to_owned(),
+                summary: "Changed boot config (+1)".to_owned(),
+                added_lines: 1,
+                removed_lines: 0,
+                diff: Some("(+) options mitigations=off".to_owned()),
+            }],
+        )
+        .expect("system event append should succeed");
+
+        app.append_events(
+            Scope::User,
+            &[JournalEvent {
+                timestamp: OffsetDateTime::parse("2026-04-03T11:00:00Z", &Rfc3339)
+                    .expect("timestamp should parse"),
+                scope: Scope::User,
+                kind: EventKind::Modified,
+                category: Category::Shell,
+                path: "/home/test/.config/fish/config.fish".to_owned(),
+                summary: "Changed shell config".to_owned(),
+                added_lines: 0,
+                removed_lines: 0,
+                diff: None,
+            }],
+        )
+        .expect("user event append should succeed");
+
+        let output = app
+            .list_history(HistoryQuery {
+                scopes: &[Scope::System, Scope::User],
+                include: &[],
+                exclude: &[],
+                path: None,
+                all: true,
+                since: None,
+                until: None,
+                clean: true,
+            })
+            .expect("merged history should render");
+
+        let boot_index = output
+            .find("[system/boot]")
+            .expect("system event should be present");
+        let shell_index = output
+            .find("[user/shell]")
+            .expect("user event should be present");
+        assert!(boot_index < shell_index);
+    }
+
+    #[test]
+    fn merged_history_respects_include_and_exclude_filters() {
+        let env = TestEnv::new();
+        let app = env.app();
+
+        let events = [
+            JournalEvent {
+                timestamp: OffsetDateTime::parse("2026-04-03T10:00:00Z", &Rfc3339)
+                    .expect("timestamp should parse"),
+                scope: Scope::System,
+                kind: EventKind::Modified,
+                category: Category::Boot,
+                path: "/boot/loader/entries/arch.conf".to_owned(),
+                summary: "Changed boot config (+1)".to_owned(),
+                added_lines: 1,
+                removed_lines: 0,
+                diff: Some("(+) options mitigations=off".to_owned()),
+            },
+            JournalEvent {
+                timestamp: OffsetDateTime::parse("2026-04-03T11:00:00Z", &Rfc3339)
+                    .expect("timestamp should parse"),
+                scope: Scope::User,
+                kind: EventKind::Modified,
+                category: Category::Shell,
+                path: "/home/test/.config/fish/config.fish".to_owned(),
+                summary: "Changed shell config".to_owned(),
+                added_lines: 0,
+                removed_lines: 0,
+                diff: None,
+            },
+        ];
+
+        app.append_events(Scope::System, &events[..1])
+            .expect("system event append should succeed");
+        app.append_events(Scope::User, &events[1..])
+            .expect("user event append should succeed");
+
+        let output = app
+            .list_history(HistoryQuery {
+                scopes: &[Scope::System, Scope::User],
+                include: &[Category::Boot, Category::Shell],
+                exclude: &[Category::Boot],
+                path: None,
+                all: true,
+                since: None,
+                until: None,
+                clean: true,
+            })
+            .expect("filtered merged history should render");
+
+        assert!(output.contains("[user/shell]"));
+        assert!(!output.contains("[system/boot]"));
+    }
+
+    #[test]
+    fn rendered_systemd_units_match_scope_flags() {
+        let system = render_systemd_unit(Scope::System, Path::new("/usr/bin/changedd"));
+        let user = render_systemd_unit(Scope::User, Path::new("/usr/bin/changedd"));
+
+        assert!(system.contains("ExecStart=/usr/bin/changedd --system"));
+        assert!(system.contains("WantedBy=multi-user.target"));
+        assert!(user.contains("ExecStart=/usr/bin/changedd --user"));
+        assert!(user.contains("WantedBy=default.target"));
     }
 
     #[test]
@@ -1657,7 +2233,7 @@ mod tests {
         let app = env.app();
 
         let error = app
-            .set_diff_mode("/does/not/exist", DiffMode::Unified)
+            .set_diff_mode(Scope::System, "/does/not/exist", DiffMode::Unified)
             .expect_err("missing tracked path should fail");
         assert!(error.to_string().contains("is not tracked yet"));
     }
@@ -1682,6 +2258,7 @@ mod tests {
             JournalEvent {
                 timestamp: OffsetDateTime::parse("2026-04-03T01:00:00Z", &Rfc3339)
                     .expect("timestamp should parse"),
+                scope: Scope::System,
                 kind: EventKind::Modified,
                 category: Category::Build,
                 path: "/etc/makepkg.conf".to_owned(),
@@ -1693,6 +2270,7 @@ mod tests {
             JournalEvent {
                 timestamp: OffsetDateTime::parse("2026-04-04T01:00:00Z", &Rfc3339)
                     .expect("timestamp should parse"),
+                scope: Scope::User,
                 kind: EventKind::Modified,
                 category: Category::Shell,
                 path: "/home/test/.config/fish/config.fish".to_owned(),
@@ -1714,6 +2292,7 @@ mod tests {
         let events = vec![JournalEvent {
             timestamp: OffsetDateTime::parse("2026-04-03T01:00:00Z", &Rfc3339)
                 .expect("timestamp should parse"),
+            scope: Scope::System,
             kind: EventKind::Modified,
             category: Category::Build,
             path: "/etc/makepkg.conf".to_owned(),
@@ -1724,7 +2303,7 @@ mod tests {
         }];
 
         let rendered = render_history(&events, true, None);
-        assert!(rendered.contains("- 1:00am [build] /etc/makepkg.conf: Changed build config (+2/-1)"));
+        assert!(rendered.contains("- 1:00am [system/build] /etc/makepkg.conf: Changed build config (+2/-1)"));
         assert!(!rendered.contains("(+) MAKEFLAGS"));
     }
 
@@ -1735,18 +2314,84 @@ mod tests {
         let tracked = env.root.join("tracked.conf");
         fs::write(&tracked, "value=1\n").expect("tracked file should be writable");
 
-        app.track_file(tracked.to_string_lossy().as_ref())
+        app.track_file(Scope::User, tracked.to_string_lossy().as_ref())
             .expect("tracking should succeed");
         let message = app
-            .run_daemon(DaemonOptions {
+            .run_daemon(Scope::User, DaemonOptions {
                 once: true,
                 interval: Duration::from_secs(1),
             })
             .expect("daemon run should succeed");
 
         assert!(message.contains("Baseline captured"));
-        let events = app.load_events().expect("events should load");
+        let events = app.load_events(Scope::User).expect("events should load");
         assert!(events.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_files_are_written_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = TestEnv::new();
+        let app = env.app();
+
+        app.init(Scope::User).expect("user init should succeed");
+        app.init(Scope::System).expect("system init should succeed");
+
+        let user_config_mode = fs::metadata(app.user_paths.config_file())
+            .expect("user config should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let user_state_mode = fs::metadata(app.user_paths.state_home.join("journal.jsonl"))
+            .or_else(|_| {
+                app.append_events(
+                    Scope::User,
+                    &[JournalEvent {
+                        timestamp: OffsetDateTime::parse("2026-04-03T10:00:00Z", &Rfc3339)
+                            .expect("timestamp should parse"),
+                        scope: Scope::User,
+                        kind: EventKind::Modified,
+                        category: Category::Shell,
+                        path: "/tmp/test".to_owned(),
+                        summary: "Changed shell config".to_owned(),
+                        added_lines: 0,
+                        removed_lines: 0,
+                        diff: None,
+                    }],
+                )
+                .expect("user journal append should succeed");
+                fs::metadata(app.user_paths.state_home.join("journal.jsonl"))
+            })
+            .expect("user journal should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        let system_config_mode = fs::metadata(app.system_paths.config_file())
+            .expect("system config should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(user_config_mode, 0o600);
+        assert_eq!(user_state_mode, 0o600);
+        assert_eq!(system_config_mode, 0o600);
+
+        let user_dir_mode = fs::metadata(&app.user_paths.state_home)
+            .expect("user state dir should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let system_dir_mode = fs::metadata(&app.system_paths.state_home)
+            .expect("system state dir should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(user_dir_mode, 0o700);
+        assert_eq!(system_dir_mode, 0o700);
     }
 
     #[test]
@@ -1756,6 +2401,7 @@ mod tests {
                 timestamp: OffsetDateTime::parse("2026-04-03T01:00:00Z", &Rfc3339)
                     .expect("timestamp should parse")
                     + time::Duration::minutes(index),
+                scope: Scope::System,
                 kind: EventKind::Modified,
                 category: Category::Build,
                 path: format!("/tmp/{index}.conf"),
@@ -1779,6 +2425,7 @@ mod tests {
         let previous = BTreeMap::from([(
             "/tmp/one.conf".to_owned(),
             ObservedPath {
+                scope: Scope::System,
                 path: "/tmp/one.conf".to_owned(),
                 category: Category::Services,
                 diff_mode: DiffMode::Unified,
@@ -1793,6 +2440,7 @@ mod tests {
             (
                 "/tmp/one.conf".to_owned(),
                 ObservedPath {
+                    scope: Scope::System,
                     path: "/tmp/one.conf".to_owned(),
                     category: Category::Services,
                     diff_mode: DiffMode::Unified,
@@ -1805,6 +2453,7 @@ mod tests {
             (
                 "/tmp/two.conf".to_owned(),
                 ObservedPath {
+                    scope: Scope::System,
                     path: "/tmp/two.conf".to_owned(),
                     category: Category::Services,
                     diff_mode: DiffMode::Unified,

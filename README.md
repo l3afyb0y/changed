@@ -1,6 +1,7 @@
 # changed
 
-`changed` is a lightweight system tuning changelog for Arch Linux.
+`changed` is a lightweight system tuning changelog with a dedicated daemon for
+systemd-based systems.
 
 It is built to answer:
 
@@ -8,7 +9,8 @@ It is built to answer:
 - Which changes mattered for CPU, GPU, services, shell, boot, or build tuning?
 - What do I need to carry forward to a new install or new hardware?
 
-It is not a backup, rollback, or recovery tool.
+It is not a backup, rollback, or recovery tool. Its purpose is to make system
+configuration changes easier to audit and reproduce.
 
 ## Current Status
 
@@ -27,8 +29,8 @@ The project currently has two binaries:
 
 - `changed`: user-facing CLI for tracking targets, browsing history, and
   managing diff/redaction policy
-- `changedd`: dedicated daemon process for watching tracked paths and
-  appending journal events
+- `changedd`: dedicated daemon for watching tracked paths and appending
+  journal events in either user or system scope
 
 The daemon is event-driven through `notify`, with scan/diff verification layered
 underneath for correctness. It captures an initial baseline, then records
@@ -269,11 +271,15 @@ For the intended human-readable changelog style, see [example-log.md](example-lo
 - [CLI help drafts](docs/help-text.md)
 - [Man-page-style reference](docs/changed.1.md)
 - [Category definitions](docs/categories.md)
+- [Packaging workflow](docs/packaging-workflow.md)
 
 ## Arch Packaging
 
 This repo now includes a local-source [PKGBUILD](PKGBUILD) and packaged unit
-files under [packaging/systemd/system/changedd.service](/home/rowen/github-branches/changed/packaging/systemd/system/changedd.service) and [packaging/systemd/user/changedd.service](/home/rowen/github-branches/changed/packaging/systemd/user/changedd.service).
+files under
+[packaging/systemd/system/changedd.service](packaging/systemd/system/changedd.service)
+and
+[packaging/systemd/user/changedd.service](packaging/systemd/user/changedd.service).
 
 The PKGBUILD installs:
 
@@ -281,3 +287,15 @@ The PKGBUILD installs:
 - `changedd`
 - both systemd unit files
 - project documentation and license files
+
+After installing the package, the units are already present under
+`/usr/lib/systemd`. You can enable them directly:
+
+```bash
+sudo systemctl enable --now changedd.service
+systemctl --user enable --now changedd.service
+```
+
+`changed service install` is mainly for local development or non-packaged
+installs where the unit should be generated dynamically from the current binary
+location.

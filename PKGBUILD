@@ -1,3 +1,4 @@
+# Hand-maintained PKGBUILD for Arch packaging.
 pkgname=changed
 pkgver=0.3.0
 pkgrel=1

@@ -5,6 +5,7 @@ use changed::config::{DiffMode, RedactionMode};
 use changed::scope::Scope;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueHint};
 use nix::unistd::Uid;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -100,8 +101,9 @@ fn run() -> Result<()> {
         Some(Commands::List(args)) => {
             let scopes = args.scope_flags.resolve_reads();
             ensure_privileged_scopes(&scopes)?;
+            let color = args.color.should_color();
             let output = if args.tracked {
-                app.list_tracked(&scopes, &args.include, &args.exclude, args.path.as_deref())?
+                app.list_tracked(&scopes, &args.include, &args.exclude, args.path.as_deref(), color)?
             } else {
                 app.list_history(
                     HistoryQuery {
@@ -113,6 +115,7 @@ fn run() -> Result<()> {
                         since: args.since.as_deref(),
                         until: args.until.as_deref(),
                         clean: args.clean_view,
+                        color,
                     },
                 )?
             };
@@ -188,7 +191,7 @@ enum Commands {
     Daemon(DaemonArgs),
     #[command(
         about = "Manage the changed systemd service",
-        after_help = "Examples:\n  changed service install -U\n  changed service start -U\n  sudo changed service install -S\n  sudo changed service status -S"
+        after_help = "Notes:\n  Service commands require an explicit scope.\n  `install` writes a generated unit for local/dev or non-packaged installs.\n  For packaged installs, use `systemctl enable --now changedd.service` or\n  `systemctl --user enable --now changedd.service` directly.\n\nExamples:\n  changed service install -U\n  changed service start -U\n  sudo changed service install -S\n  sudo changed service status -S"
     )]
     Service(ServiceArgs),
     #[command(
@@ -355,6 +358,25 @@ struct ListArgs {
     until: Option<String>,
     #[arg(short = 'C', long = "clean-view", help = "Show a low-noise view of relevant changes")]
     clean_view: bool,
+    #[arg(long = "color", value_enum, default_value_t = ColorMode::Auto, help = "Control color output")]
+    color: ColorMode,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorMode {
+    fn should_color(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
 }
 
 #[derive(Args, Debug)]

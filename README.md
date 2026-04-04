@@ -261,6 +261,15 @@ Environment overrides:
 - `CHANGED_SYSTEM_CONFIG_HOME`
 - `CHANGED_SYSTEM_STATE_HOME`
 
+These override the config and state roots, which means they also control where
+the journal files live:
+
+- user journal: `$CHANGED_STATE_HOME/journal.jsonl`
+- system journal: `$CHANGED_SYSTEM_STATE_HOME/journal.jsonl`
+
+There is no separate `CHANGED_LIST_LOCATION` because `changed list` reads from
+the journal inside the selected scope's state directory.
+
 ## Example Output
 
 For the intended human-readable changelog style, see [example-log.md](example-log.md).

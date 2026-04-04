@@ -2,7 +2,7 @@
 
 ## NAME
 
-`changed` - lightweight system tuning changelog for Arch Linux
+`changed` - lightweight system tuning changelog for Systemd-based Linux distros.
 
 ## SYNOPSIS
 
@@ -20,8 +20,7 @@ changes while its daemon is running.
 It is designed to answer:
 
 - What did I change over time?
-- Which changes were related to CPU, GPU, services, shell, boot, or other
-  tuning?
+- Which changes were related to CPU, GPU, services, shell, boot, or other tuning?
 - What do I need to carry forward to a new install or new hardware?
 
 `changed` is not a backup, rollback, snapshot, or recovery tool.
@@ -110,10 +109,15 @@ Service commands require an explicit scope.
 
 Current behavior:
 
-- `install` writes a scope-specific unit file and runs `daemon-reload`
+- `install` writes a generated scope-specific unit file and runs `daemon-reload`
 - `start` runs `enable --now` for that scope
 - `stop` runs `disable --now` for that scope
 - `status` runs `systemctl status` for that scope
+
+For packaged Arch installs, the unit files are already shipped under
+`/usr/lib/systemd`. In that case, `install` is mainly useful for local
+development or non-packaged installs where the unit should be generated from
+the current binary location.
 
 ### `track`
 
@@ -209,6 +213,9 @@ This is intended to become:
 
 Packaged unit files are also provided for Arch installs.
 
+For packaged installs, enabling the service normally uses `systemctl` directly
+rather than `changed service install`.
+
 ## SECURITY MODEL
 
 Tracking, diffing, and redaction are separate controls.
@@ -278,6 +285,15 @@ Environment overrides:
 - `CHANGED_STATE_HOME`
 - `CHANGED_SYSTEM_CONFIG_HOME`
 - `CHANGED_SYSTEM_STATE_HOME`
+
+These override the config and state roots, so they also control where journal
+files are stored:
+
+- user journal: `$CHANGED_STATE_HOME/journal.jsonl`
+- system journal: `$CHANGED_SYSTEM_STATE_HOME/journal.jsonl`
+
+There is no separate `CHANGED_LIST_LOCATION` because `changed list` reads from
+the journal inside the selected scope's state directory.
 
 ## RETENTION
 

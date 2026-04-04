@@ -48,6 +48,7 @@ target
 .claude/
 .codex/
 .cursor/
+.copilot/
 
 # Local test and coverage output
 coverage/
@@ -55,3 +56,10 @@ dist/
 
 # Built Arch packages
 *.pkg.tar.*
+
+# Dev files
+docs/pre-release-checklist.md
+docs/potential-improvements.md
+
+# Generated man page
+docs/changed.1

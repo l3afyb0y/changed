@@ -126,6 +126,7 @@ pub struct HistoryQuery<'a> {
     pub since: Option<&'a str>,
     pub until: Option<&'a str>,
     pub clean: bool,
+    pub color: bool,
 }
 
 impl App {
@@ -167,6 +168,7 @@ impl App {
         include: &[Category],
         exclude: &[Category],
         path: Option<&Path>,
+        color: bool,
     ) -> Result<String> {
         let mut scoped_configs = Vec::new();
         let path_filter = path.map(normalize_display_path);
@@ -180,7 +182,12 @@ impl App {
             scoped_configs.push((scope, config));
         }
 
-        Ok(render_tracked(&scoped_configs, filters, path_filter.as_deref()))
+        Ok(render_tracked(
+            &scoped_configs,
+            filters,
+            path_filter.as_deref(),
+            color,
+        ))
     }
 
     pub fn list_history(&self, query: HistoryQuery<'_>) -> Result<String> {
@@ -217,7 +224,7 @@ impl App {
                 String::from("No change history recorded yet.")
             });
         }
-        Ok(render_history(&events, query.clean, None))
+        Ok(render_history(&events, query.clean, None, query.color))
     }
 
     pub fn run_daemon(&self, scope: Scope, options: DaemonOptions) -> Result<String> {
@@ -736,12 +743,65 @@ impl<'a> CategoryFilters<'a> {
     }
 }
 
+struct Palette {
+    enabled: bool,
+}
+
+impl Palette {
+    fn new(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
+    fn paint(&self, code: &str, text: impl AsRef<str>) -> String {
+        let text = text.as_ref();
+        if self.enabled {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+
+    fn date(&self, text: impl AsRef<str>) -> String {
+        self.paint("1;2", text)
+    }
+
+    fn time(&self, text: impl AsRef<str>) -> String {
+        self.paint("36", text)
+    }
+
+    fn category(&self, text: impl AsRef<str>) -> String {
+        self.paint("35", text)
+    }
+
+    fn path(&self, text: impl AsRef<str>) -> String {
+        self.paint("34", text)
+    }
+
+    fn add(&self, text: impl AsRef<str>) -> String {
+        self.paint("32", text)
+    }
+
+    fn remove(&self, text: impl AsRef<str>) -> String {
+        self.paint("31", text)
+    }
+
+    fn muted(&self, text: impl AsRef<str>) -> String {
+        self.paint("2", text)
+    }
+
+    fn undefined_category(&self, text: impl AsRef<str>) -> String {
+        self.paint("33", text)
+    }
+}
+
 fn render_tracked(
     scoped_configs: &[(Scope, Config)],
     filters: CategoryFilters<'_>,
     path: Option<&str>,
+    color: bool,
 ) -> String {
     let mut out = String::new();
+    let palette = Palette::new(color);
     if scoped_configs.is_empty() {
         return String::from("Nothing is currently tracked for that filter.");
     }
@@ -787,12 +847,12 @@ fn render_tracked(
                 continue;
             }
 
-            let _ = writeln!(out, "  {}:", current);
+            let _ = writeln!(out, "  {}:", palette.category(current.to_string()));
             for entry in section_paths {
                 let _ = writeln!(
                     out,
                     "    - {} [{}; {}; {}]",
-                    entry.path,
+                    palette.path(&entry.path),
                     kind_label(entry.kind),
                     diff_mode_label(entry.diff_mode),
                     redaction_label(entry.redaction)
@@ -811,7 +871,7 @@ fn render_tracked(
     out.trim_end().to_owned()
 }
 
-fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>) -> String {
+fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>, color: bool) -> String {
     let mut sorted: Vec<&JournalEvent> = events.iter().collect();
     sorted.sort_by_key(|event| event.timestamp);
     let selected: Vec<&JournalEvent> = match limit {
@@ -820,6 +880,7 @@ fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>) ->
     };
 
     let mut out = String::from("# Changes\n\n");
+    let palette = Palette::new(color);
     let mut current_date: Option<Date> = None;
     for event in selected {
         let date = event.timestamp.date();
@@ -828,26 +889,45 @@ fn render_history(events: &[JournalEvent], clean: bool, limit: Option<usize>) ->
                 out.push('\n');
             }
             current_date = Some(date);
-            let _ = writeln!(out, "## {}\n", format_date(date));
+            let _ = writeln!(out, "## {}\n", palette.date(format_date(date)));
         }
 
         if clean {
             let _ = writeln!(
                 out,
-                "- {} [{}/{}] {}",
-                format_time(event.timestamp.time()),
+                "- {} [{}/{}] {}: {}{}",
+                palette.time(format_time(event.timestamp.time())),
                 event.scope,
-                event.category,
-                clean_summary(event)
+                palette.category(event.category.to_string()),
+                palette.path(&event.path),
+                event.summary,
+                if event.diff.is_none() && event.kind == EventKind::Modified {
+                    format!(" {}", palette.muted("[metadata-only]"))
+                } else {
+                    String::new()
+                }
             );
         } else {
-            let _ = writeln!(out, "### {}", format_time(event.timestamp.time()));
+            let _ = writeln!(out, "### {}", palette.time(format_time(event.timestamp.time())));
             let _ = writeln!(out, "Scope: {}", event.scope);
-            let _ = writeln!(out, "{}", event.path);
+            let category_text = if event.category == Category::Packages {
+                palette.undefined_category(event.category.to_string())
+            } else {
+                palette.category(event.category.to_string())
+            };
+            let _ = writeln!(out, "Category: {category_text}");
+            let _ = writeln!(out, "{}", palette.path(&event.path));
             let _ = writeln!(out, "{}", event.summary);
             if let Some(diff) = &event.diff {
                 for line in diff.lines() {
-                    let _ = writeln!(out, "{line}");
+                    let styled = if line.starts_with("(+) ") {
+                        palette.add(line)
+                    } else if line.starts_with("(-) ") {
+                        palette.remove(line)
+                    } else {
+                        line.to_owned()
+                    };
+                    let _ = writeln!(out, "{styled}");
                 }
             }
             out.push('\n');
@@ -1081,14 +1161,6 @@ fn summarize_event(kind: &EventKind, category: Category, added_lines: usize, rem
         },
         EventKind::Removed => format!("Removed {area}"),
     }
-}
-
-fn clean_summary(event: &JournalEvent) -> String {
-    let mut line = format!("{}: {}", event.path, event.summary);
-    if event.diff.is_none() && event.kind == EventKind::Modified {
-        line.push_str(" [metadata-only]");
-    }
-    line
 }
 
 fn category_label(category: Category) -> &'static str {
@@ -2092,6 +2164,7 @@ mod tests {
                 &[Category::Build, Category::Shell],
                 &[Category::Build],
                 None,
+                false,
             )
             .expect("tracked listing should succeed");
 
@@ -2150,6 +2223,7 @@ mod tests {
                 since: None,
                 until: None,
                 clean: true,
+                color: false,
             })
             .expect("merged history should render");
 
@@ -2209,6 +2283,7 @@ mod tests {
                 since: None,
                 until: None,
                 clean: true,
+                color: false,
             })
             .expect("filtered merged history should render");
 
@@ -2281,7 +2356,7 @@ mod tests {
             },
         ];
 
-        let rendered = render_history(&events, false, None);
+        let rendered = render_history(&events, false, None, false);
         assert!(rendered.contains("# Changes"));
         assert!(rendered.contains("## 04/03/26"));
         assert!(rendered.contains("## 04/04/26"));
@@ -2302,9 +2377,29 @@ mod tests {
             diff: Some("(-) MAKEFLAGS=-j8\n(+) MAKEFLAGS=-j16".to_owned()),
         }];
 
-        let rendered = render_history(&events, true, None);
+        let rendered = render_history(&events, true, None, false);
         assert!(rendered.contains("- 1:00am [system/build] /etc/makepkg.conf: Changed build config (+2/-1)"));
         assert!(!rendered.contains("(+) MAKEFLAGS"));
+    }
+
+    #[test]
+    fn clean_history_can_render_with_color() {
+        let events = vec![JournalEvent {
+            timestamp: OffsetDateTime::parse("2026-04-03T01:00:00Z", &Rfc3339)
+                .expect("timestamp should parse"),
+            scope: Scope::System,
+            kind: EventKind::Modified,
+            category: Category::Build,
+            path: "/etc/makepkg.conf".to_owned(),
+            summary: "Changed build config (+2/-1)".to_owned(),
+            added_lines: 2,
+            removed_lines: 1,
+            diff: Some("(-) MAKEFLAGS=-j8\n(+) MAKEFLAGS=-j16".to_owned()),
+        }];
+
+        let rendered = render_history(&events, true, None, true);
+        assert!(rendered.contains("\u{1b}["));
+        assert!(rendered.contains("Changed build config (+2/-1)"));
     }
 
     #[test]

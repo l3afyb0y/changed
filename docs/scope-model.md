@@ -2,18 +2,16 @@
 
 This document describes the current scope and security model for `changed`.
 
-It is the foundation for the upcoming systemd integration work.
+It is the foundation for the current scoped CLI and `systemd` service model.
 
 ## Why Scopes Exist
 
 `changed` needs to track both:
 
-- machine-wide tuning such as bootloader entries, kernel cmdline files,
-  `/etc` configuration, and system units
+- machine-wide tuning such as bootloader entries, kernel cmdline files, `/etc` configuration, and system units
 - per-user tuning such as `~/.config`, shell startup files, and user services
 
-Those two kinds of data should not live in one flat journal with one flat
-permission model.
+Those two kinds of data should not live in one flat journal with one flat permission model.
 
 ## Scope Types
 
@@ -115,14 +113,11 @@ The goal is not to force every `changed` command through `sudo`.
 Instead, data should be private to its scope owner:
 
 - system logs and state should be root-owned and root-readable only
-- user logs, state, and config should be owned by the user and created with
-  private permissions
+- user logs, state, and config should be owned by the user and created with private permissions
 - reading system-scope logs generally requires privilege
-- reading another user's logs should require privilege and an explicit future
-  user-selection mechanism
+- reading another user's logs should require privilege and an explicit future user-selection mechanism
 
-This reduces accidental exposure without breaking normal user-scope tracking
-workflows.
+This reduces accidental exposure without breaking normal user-scope tracking workflows.
 
 ## Services
 
@@ -136,12 +131,11 @@ The intended enable flows are separate:
 - `sudo systemctl enable --now changedd`
 - `systemctl --user enable --now changedd`
 
-That keeps user tracking opt-in and avoids surprising users with automatic
-per-user background services.
+That keeps user tracking opt-in and avoids surprising users with automatic per-user background services.
 
 ## Remaining Questions
 
-These are still worth revisiting before service work:
+These are still worth revisiting as the service model matures:
 
 - how to present merged reads when system scope exists but the current user
   lacks permission to read it

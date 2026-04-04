@@ -58,6 +58,7 @@ Options:
   -s, --since TIME          Show entries since TIME (RFC3339)
   -u, --until TIME          Show entries until TIME (RFC3339)
   -C, --clean-view          Show a low-noise view of relevant changes
+      --color COLOR         Control color output (auto, always, never)
   -h, --help                Show this help text
 ```
 
@@ -159,7 +160,7 @@ Usage:
 changed service - manage the changed systemd service
 
 Usage:
-  changed service <action> [scope]
+  changed service [options] <action>
 
 Actions:
   install              Install the changed systemd unit
@@ -172,9 +173,11 @@ Notes:
 
 ```text
 Service commands require an explicit scope.
-`install` writes a unit file and runs daemon-reload.
+`install` writes a generated unit file and runs daemon-reload.
 `start` enables and starts the unit for that scope.
 `stop` disables and stops the unit for that scope.
+For packaged installs, the unit files already exist under /usr/lib/systemd,
+so `install` is mainly for local/dev or non-packaged setups.
 ```
 
 ## `changed daemon --help`

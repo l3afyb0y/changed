@@ -2,7 +2,6 @@ use changed::app::{App, DaemonOptions};
 use changed::scope::Scope;
 use nix::unistd::Uid;
 use std::env;
-use std::time::Duration;
 
 fn main() {
     if let Err(error) = run() {
@@ -25,22 +24,13 @@ where
 {
     let mut scope = Scope::User;
     let mut once = false;
-    let mut interval_seconds = 2u64;
-    let mut args = args.into_iter();
+    let args = args.into_iter();
 
-    while let Some(arg) = args.next() {
+    for arg in args {
         match arg.as_str() {
             "--system" => scope = Scope::System,
             "--user" => scope = Scope::User,
             "--once" => once = true,
-            "--interval-seconds" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --interval-seconds"))?;
-                interval_seconds = value.parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("invalid value for --interval-seconds: {value}")
-                })?;
-            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -55,21 +45,15 @@ where
         }
     }
 
-    Ok((
-        scope,
-        DaemonOptions {
-            once,
-            interval: Duration::from_secs(interval_seconds),
-        },
-    ))
+    Ok((scope, DaemonOptions { once }))
 }
 
 fn print_help() {
     println!(
         "changedd - dedicated daemon for changed\n\n\
 Usage:\n  changedd [options]\n\n\
-Options:\n  --once                     Run one scan cycle and exit\n  --interval-seconds SECONDS Polling interval in seconds for fallback waiting\n  --system                   Run in system scope\n  --user                     Run in user scope\n  -h, --help                 Show this help text\n  -V, --version              Show version\n\n\
-Examples:\n  changedd --user\n  changedd --system --once\n  changedd --user --interval-seconds 5"
+Options:\n  --once                     Run one scan cycle and exit\n  --system                   Run in system scope\n  --user                     Run in user scope\n  -h, --help                 Show this help text\n  -V, --version              Show version\n\n\
+Examples:\n  changedd --user\n  changedd --system --once"
     );
 }
 

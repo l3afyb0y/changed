@@ -34,13 +34,14 @@ Current features include:
 - file-backed journaling
 - diff and redaction controls
 - include/exclude category filtering
+- optional pager output for history views
 - scoped service install, start, stop, and status commands
+- a dedicated *changed status* diagnostics command
 
 Still planned:
 
 - package event tracking
 - service-state event tracking
-- dedicated daemon diagnostics
 
 # SCOPE MODEL
 
@@ -55,11 +56,16 @@ system units, and scheduler config.
 Use *-U*, *--user* for per-user files such as ~/.config, shell startup files,
 user services, and desktop or audio config.
 
-For read commands, no scope flag defaults to merged output from system scope
-plus the current user's scope. *-SU* is a valid explicit merged read.
+For read commands, no scope flag defaults to current-user output. *-SU* is a
+valid explicit merged read of system plus current-user history.
 
-For write commands, exactly one scope must be targeted. If scope cannot be
-inferred safely, the command should fail and ask for *-S* or *-U*.
+For write commands, exactly one scope must usually be targeted. The current
+exception is *changed history clear*, which also accepts *-SU* to clear both
+scopes in one confirmed operation. If scope cannot be inferred safely, the
+command should fail and ask for *-S* or *-U*.
+
+When *changed* is run under sudo, user scope still refers to the invoking
+user's config and state directories rather than root's personal user scope.
 
 # COMMANDS
 
@@ -85,6 +91,19 @@ inferred safely, the command should fail and ask for *-S* or *-U*.
 	under /usr/lib/systemd, so *install* is mainly for local development or
 	non-packaged installs.
 
+	Packaged upgrades do not restart either scope automatically. Restart the
+	scope you use explicitly after reinstalling:
+
+	- systemctl --user restart changedd.service
+	- sudo systemctl restart changedd.service
+
+*status*
+	Show operational diagnostics for one or both scopes.
+
+	It reports scope paths, tracked counts, categories, watcher roots, service
+	state, daemon PID when available, recent journal/daemon-state metadata, and
+	warnings for obvious operational issues.
+
 *track*
 	Track a file path, category preset, or package target in one scope.
 
@@ -100,18 +119,23 @@ inferred safely, the command should fail and ask for *-S* or *-U*.
 *redact* <action> <path>
 	Enable or disable automatic redaction for a tracked path.
 
+*history* clear
+	Clear stored journal data and the daemon baseline for one or both scopes
+	after a destructive confirmation prompt that names the selected scope.
+
 # LIST BEHAVIOR
 
 *changed list* is the primary read command.
 
-By default it shows a recent slice of history and merges system plus current
-user scopes when no scope flags are given.
+By default it shows a recent slice of history for the current user scope.
+Use *-SU* for an explicit merged system plus current-user view.
 
 Useful flags:
 
 - *-a*, *--all* to show full retained history
 - *-C*, *--clean-view* for a low-noise view
 - *--color* auto|always|never to control ANSI color output
+- *--pager* to open the rendered output in $PAGER or less -R
 - *-i*, *--include* CATEGORY to keep only matching categories
 - *-e*, *--exclude* CATEGORY to remove categories from the result
 
@@ -125,6 +149,11 @@ The daemon uses an event-driven watcher with scan and diff verification.
 - config changes are reloaded automatically
 - newly added tracked targets are silently baselined on reload
 - existing tracked targets preserve prior observation state across reloads
+- watcher events refresh only the affected tracked path or tracked-directory
+  descendant instead of rebuilding the whole tracked scope
+
+*changed status* is the preferred command for checking whether a scope is
+healthy, configured, and actively recording changes.
 
 # DEVELOPMENT
 
@@ -132,6 +161,8 @@ Typical local commands:
 
 - *cargo run --bin changed -- init -U*
 - *cargo run --bin changed -- track -U ~/.config/fish/config.fish*
+- *cargo run --bin changed -- track ~/.config/fish/config.fish -U*
+- *cargo run --bin changed -- status*
 - *cargo run --bin changedd -- --user --once*
 - *cargo run --bin changed -- list -U -C*
 
@@ -162,4 +193,4 @@ Environment overrides:
 These override the config and state roots, so they also control where journal
 files are stored. There is no separate CHANGED_LIST_LOCATION because
 *changed list* reads from the journal inside the selected scope's state
-directory.
+directory. $PAGER is only used when *changed list --pager* is requested.

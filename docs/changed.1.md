@@ -35,7 +35,9 @@ The current codebase provides:
 - file-backed journaling
 - diff and redaction controls
 - category-aware rendering with include/exclude filters
+- optional pager output for history views
 - scoped systemd service install/start/stop/status commands
+- a dedicated `changed status` diagnostics command
 
 Package tracking and service-state event tracking are still future work.
 
@@ -65,12 +67,18 @@ The scope flags are:
 - `-S`, `--system`
 - `-U`, `--user`
 
-For read commands, no scope flag defaults to merged output from both system
-scope and the current user's scope. `-SU` is a valid explicit merged read.
+For read commands, no scope flag defaults to current-user output. `-SU` is a
+valid explicit merged read of system plus current-user history.
 
-For write commands, exactly one scope must be targeted. If scope cannot be
-inferred safely for a path-based write, the command should fail and ask the
-user to specify `-S` or `-U`.
+For write commands, exactly one scope must usually be targeted. The current
+exception is `changed history clear`, which also accepts `-SU` to clear both
+scopes in one confirmed operation. If scope cannot be inferred safely for a
+path-based write, the command should fail and ask the user to specify `-S` or
+`-U`.
+
+When `changed` is run under `sudo`, user scope continues to refer to the
+invoking user's config and state directories rather than root's personal user
+scope.
 
 See also [docs/scope-model.md](scope-model.md).
 
@@ -90,7 +98,6 @@ Supported today:
 - `-S`, `--system`
 - `-U`, `--user`
 - `--once`
-- `--interval-seconds <seconds>`
 
 For long-running daemon use, prefer the dedicated binary `changedd`.
 
@@ -119,6 +126,32 @@ For packaged Arch installs, the unit files are already shipped under
 development or non-packaged installs where the unit should be generated from
 the current binary location.
 
+Packaged upgrades do not restart either scope automatically. Restart the scope
+you use explicitly after reinstalling:
+
+- `systemctl --user restart changedd.service`
+- `sudo systemctl restart changedd.service`
+
+### `status`
+
+Show operational diagnostics for one or both scopes.
+
+Supported today:
+
+- `-S`, `--system`
+- `-U`, `--user`
+- `--pager`
+
+The command reports:
+
+- whether the scope is initialized
+- config, state, journal, and daemon-state paths
+- tracked path/package counts and tracked categories
+- watcher roots derived from the current config
+- service active/enabled state and daemon PID when available
+- last recorded event time and daemon-state update time
+- warnings for obvious operational issues
+
 ### `track`
 
 Track a file path, category preset, or package target in one scope.
@@ -126,6 +159,7 @@ Track a file path, category preset, or package target in one scope.
 Examples:
 
 - `changed track -U ~/.config/fish/config.fish`
+- `changed track ~/.config/fish/config.fish -U`
 - `sudo changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U category shell`
 
@@ -149,6 +183,7 @@ Supported today:
 - `-s`, `--since <time>`
 - `-u`, `--until <time>`
 - `-C`, `--clean-view`
+- `--pager`
 
 ### `diff <action> <path>`
 
@@ -168,6 +203,13 @@ Supported actions:
 - `enable`
 - `disable`
 
+### `history clear`
+
+Clear stored journal data and the daemon baseline for one or both scopes.
+
+This command is destructive and prompts before removing files. The prompt names
+the selected scope explicitly as `user`, `system`, or `user and system`.
+
 ## LIST BEHAVIOR
 
 `changed list` is the primary read command.
@@ -176,11 +218,16 @@ Default output should:
 
 - show a recent slice of history
 - group entries in a readable changelog style
-- merge system plus current-user scopes when no scope flags are given
+- default to current-user scope when no scope flags are given
 
 `changed list -a` shows the full retained history.
 
+`changed list -SU` shows merged system plus current-user history.
+
 `changed list -C` provides a low-noise day-to-day reading mode.
+
+`changed list --pager` opens the rendered output in `$PAGER` when set, or in
+`less -R` otherwise.
 
 `--clean-view` changes presentation only. It does not delete data, alter
 history, or change what the daemon stores.
@@ -195,6 +242,9 @@ Category filter semantics:
 ## DAEMON BEHAVIOR
 
 The daemon currently uses an event-driven watcher with scan/diff verification.
+Internally it blocks on watcher events and refreshes only the affected tracked
+path or directory descendant instead of rebuilding the entire tracked scope on
+every wake.
 
 - The first daemon run captures a baseline without emitting synthetic events.
 - Config changes are reloaded automatically.
@@ -215,6 +265,9 @@ Packaged unit files are also provided for Arch installs.
 
 For packaged installs, enabling the service normally uses `systemctl` directly
 rather than `changed service install`.
+
+`changed status` is the preferred command for checking whether a scope is
+healthy, configured, and actively recording changes.
 
 ## SECURITY MODEL
 
@@ -246,6 +299,8 @@ Typical local flow:
 - `cargo run --bin changed -- init -U`
 - `cargo run --bin changed -- init -S`
 - `cargo run --bin changed -- track -U ~/.config/fish/config.fish`
+- `cargo run --bin changed -- track ~/.config/fish/config.fish -U`
+- `cargo run --bin changed -- status`
 - `cargo run --bin changedd -- --user --once`
 - `cargo run --bin changed -- list -SU -a`
 - `cargo run --bin changed -- service -U install`
@@ -295,6 +350,9 @@ files are stored:
 There is no separate `CHANGED_LIST_LOCATION` because `changed list` reads from
 the journal inside the selected scope's state directory.
 
+`$PAGER` is a standard shell environment variable used only when
+`changed list --pager` is requested.
+
 ## RETENTION
 
 The local journal currently uses bounded retention with default values:
@@ -313,12 +371,17 @@ old history can roll off over time until archival support exists.
 - `changed list -U`
 - `sudo changed list -S`
 - `sudo changed list -SU -a -C`
+- `changed status`
+- `sudo changed status -SU`
 - `changed list -i services`
 - `changed list -e packages`
 - `sudo changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U ~/.config/fish/config.fish`
+- `changed track ~/.config/fish/config.fish -U`
 - `changed diff -U enable ~/.config/fish/config.fish`
 - `sudo changed redact -S disable /etc/makepkg.conf`
+- `changed history clear -U`
+- `sudo changed history clear -SU`
 - `changed service -U install`
 - `changed service -U start`
 - `sudo changed service -S install`

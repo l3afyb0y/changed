@@ -48,7 +48,7 @@ The scope flags are:
 
 For read-oriented commands such as `changed list`:
 
-- no scope flag means merged default view
+- no scope flag means current-user default view
 - `-S` means system scope only
 - `-U` means current-user scope only
 - `-SU` is an explicit merged view of system plus current user
@@ -82,6 +82,7 @@ Examples:
 
 - `changed track -S /boot/loader/entries/arch.conf`
 - `changed track -U ~/.config/fish/config.fish`
+- `changed track ~/.config/fish/config.fish -U`
 
 For category and package writes, scope should be given explicitly.
 

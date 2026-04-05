@@ -1,30 +1,37 @@
 # Help Text Drafts
 
-These drafts reflect the current CLI surface after the scope-aware refactor.
+These drafts reflect the current CLI surface after the modular CLI and
+event-driven daemon refactor.
 
 ## `changed --help`
 
 ```text
-changed - lightweight system tuning changelog
+Lightweight system tuning changelog
 
-Usage:
-  changed <command> [options]
+Usage: changed <command> [options]
 
 Commands:
-  init       Initialize config, state, and default presets
-  daemon     Run the tracking daemon in the foreground
-  service    Manage the changed systemd service
-  track      Add a tracked file, category, or package target
-  untrack    Remove a tracked file, category, or package target
-  list       Show change history or tracked targets
-  diff       Enable or disable line-diff storage for a path
-  redact     Enable or disable redaction for a path
-  help       Show help for a command
+  init     Initialize config, state, and default presets
+  daemon   Run the tracking daemon in the foreground
+  service  Manage the changed systemd service
+  history  Manage recorded history data
+  track    Add a tracked file, category, or package target
+  untrack  Remove a tracked file, category, or package target
+  list     Show change history or tracked targets
+  diff     Enable or disable line-diff storage for a path
+  redact   Enable or disable redaction for a path
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 
 Examples:
-  changed init -U
+  changed init
   changed track -U ~/.config/fish/config.fish
   sudo changed track -S /boot/loader/entries/arch.conf
+  changed status
+  changed list -C
   changed list -U -C
   sudo changed list -SU -a
 
@@ -42,31 +49,32 @@ With two binaries in the workspace, local cargo runs should use:
 ## `changed list --help`
 
 ```text
-changed list - show change history or tracked targets
+Show change history or tracked targets
 
-Usage:
-  changed list [options]
+Usage: changed list [OPTIONS]
 
 Options:
   -S, --system              Use system scope
   -U, --user                Use user scope
   -t, --tracked             Show tracked targets instead of change events
-  -i, --include CATEGORY    Include only matching categories
-  -e, --exclude CATEGORY    Exclude matching categories
-  -p, --path PATH           Filter by exact tracked path
+  -i, --include <CATEGORY>  Include only matching categories
+  -e, --exclude <CATEGORY>  Exclude matching categories
+  -p, --path <PATH>         Filter by exact tracked path
   -a, --all                 Show full retained history
-  -s, --since TIME          Show entries since TIME (RFC3339)
-  -u, --until TIME          Show entries until TIME (RFC3339)
+  -s, --since <TIME>        Show entries since TIME (RFC3339)
+  -u, --until <TIME>        Show entries until TIME (RFC3339)
   -C, --clean-view          Show a low-noise view of relevant changes
-      --color COLOR         Control color output (auto, always, never)
-  -h, --help                Show this help text
+      --color <COLOR>       Control color output [default: auto]
+      --pager               Open output in $PAGER (or less -R) instead of printing directly
+  -h, --help                Print help
 ```
 
 Behavior:
 
 ```text
-With no scope flag, reads default to merged system + current-user output.
-`-SU` is a valid explicit merged read.
+With no scope flag, reads default to current-user output.
+`-SU` is a valid explicit merged read of system plus current-user history.
+Under sudo, `-U` still refers to the invoking user's config/state, not root's.
 ```
 
 Examples:
@@ -81,19 +89,63 @@ changed list -e packages
 changed list -SU -C -i cpu -i gpu -e services
 ```
 
+## `changed status --help`
+
+```text
+Show operational diagnostics for changed
+
+Usage: changed status [OPTIONS]
+
+Options:
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+      --pager   Open output in $PAGER (or less -R) instead of printing directly
+  -h, --help    Print help
+```
+
+Behavior:
+
+```text
+With no scope flag, diagnostics default to current-user scope.
+`-SU` is a valid explicit merged diagnostics view.
+The command reports service state, paths, tracked target counts, watcher roots,
+journal state, daemon-state metadata, and warnings for obvious operational issues.
+```
+
+Examples:
+
+```text
+changed status
+changed status -U
+sudo changed status -S
+sudo changed status -SU
+```
+
+## `changed history clear --help`
+
+```text
+Clear stored journal data for one or both scopes
+
+Usage: changed history clear [OPTIONS]
+
+Behavior:
+  Prompts before deleting the selected scope's journal and daemon baseline files.
+  `-SU` is allowed here and the prompt explicitly names both scopes.
+```
+
 ## `changed track --help`
 
 ```text
-changed track - add a tracking target
+Add a tracked file, category, or package target
 
-Usage:
-  changed track [scope] <file_path>
-  changed track [scope] category <name>
-  changed track [scope] package <manager> <package_name>
+Usage: changed track [scope] <file_path>
+       changed track [scope] category <name>
+       changed track [scope] package <manager> <package_name>
 
-Scope:
-  -S, --system          Track in system scope
-  -U, --user            Track in user scope
+Options:
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+  -h, --help    Print help
 ```
 
 Notes:
@@ -102,12 +154,14 @@ Notes:
 Writes must target exactly one scope.
 Paths may infer scope automatically when obvious.
 Category and package writes should be given an explicit scope.
+Scope flags are accepted before or after the target path.
 ```
 
 Examples:
 
 ```text
 changed track -U ~/.config/fish/config.fish
+changed track ~/.config/fish/config.fish -U
 sudo changed track -S /boot/loader/entries/arch.conf
 changed track -U category shell
 ```
@@ -115,58 +169,58 @@ changed track -U category shell
 ## `changed untrack --help`
 
 ```text
-changed untrack - remove a tracking target
+Remove a tracked file, category, or package target
 
-Usage:
-  changed untrack [scope] <file_path>
-  changed untrack [scope] category <name>
-  changed untrack [scope] package <manager> <package_name>
+Usage: changed untrack [scope] <file_path>
+       changed untrack [scope] category <name>
+       changed untrack [scope] package <manager> <package_name>
 
-Scope:
-  -S, --system          Untrack from system scope
-  -U, --user            Untrack from user scope
+Options:
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+  -h, --help    Print help
 ```
 
 Notes:
 
 ```text
 Writes must target exactly one scope.
-`-SU` is invalid for write operations.
+`-SU` remains invalid here even though `changed history clear` accepts it.
+Scope flags are accepted before or after the target path.
+```
+
+Examples:
+
+```text
+changed untrack -U ~/.config/fish/config.fish
+changed untrack ~/.config/fish/config.fish -U
+sudo changed untrack -S /boot/loader/entries/arch.conf
 ```
 
 ## `changed diff --help`
 
 ```text
-changed diff - control line-diff storage for a tracked path
+Enable or disable line-diff storage for a path
 
-Usage:
-  changed diff [scope] enable <path>
-  changed diff [scope] disable <path>
+Usage: changed diff [scope] enable <path>
+       changed diff [scope] disable <path>
 ```
 
 ## `changed redact --help`
 
 ```text
-changed redact - control automatic redaction for a tracked path
+Enable or disable redaction for a path
 
-Usage:
-  changed redact [scope] enable <path>
-  changed redact [scope] disable <path>
+Usage: changed redact [scope] enable <path>
+       changed redact [scope] disable <path>
 ```
 
 ## `changed service --help`
 
 ```text
-changed service - manage the changed systemd service
+Manage the changed systemd service
 
-Usage:
-  changed service [options] <action>
-
-Actions:
-  install              Install the changed systemd unit
-  start                Start the changed service
-  stop                 Stop the changed service
-  status               Show service status
+Usage: changed service [OPTIONS] <ACTION>
 ```
 
 Notes:
@@ -178,22 +232,22 @@ Service commands require an explicit scope.
 `stop` disables and stops the unit for that scope.
 For packaged installs, the unit files already exist under /usr/lib/systemd,
 so `install` is mainly for local/dev or non-packaged setups.
+Packaged upgrades do not restart either scope automatically; restart the scope
+you use explicitly after reinstalling.
 ```
 
 ## `changed daemon --help`
 
 ```text
-changed daemon - run the tracking daemon in the foreground
+Run the tracking daemon in the foreground
 
-Usage:
-  changed daemon [options]
+Usage: changed daemon [OPTIONS]
 
 Options:
-  -S, --system                   Use system scope
-  -U, --user                     Use user scope
-      --once                     Run one scan cycle and exit
-      --interval-seconds N       Polling interval in seconds for continuous mode
-  -h, --help                     Show this help text
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+      --once    Run one scan cycle and exit
+  -h, --help    Print help
 ```
 
 ## `changedd --help`
@@ -205,29 +259,28 @@ Usage:
   changedd [options]
 
 Options:
-      --once                     Run one scan cycle and exit
-      --interval-seconds N       Polling interval in seconds for fallback waiting
-      --system                   Run in system scope
-      --user                     Run in user scope
-  -h, --help                     Show this help text
-  -V, --version                  Show version
+  --once                     Run one scan cycle and exit
+  --system                   Run in system scope
+  --user                     Run in user scope
+  -h, --help                 Show this help text
+  -V, --version              Show version
 ```
 
 Behavior note:
 
 ```text
 One binary supports both system and user daemon modes.
-Later systemd integration should use the same executable for a system service
-and an optional per-user service.
+The daemon blocks on watcher events and refreshes only the affected tracked
+path or directory descendant instead of rebuilding the entire tracked scope
+on every wake.
 ```
 
 ## `changed init --help`
 
 ```text
-changed init - initialize changed on this system
+Initialize config, state, and default presets
 
-Usage:
-  changed init [scope]
+Usage: changed init [OPTIONS]
 
 Behavior:
   Create config and state directories

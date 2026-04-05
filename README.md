@@ -17,11 +17,13 @@ configuration changes easier to audit and reproduce.
 The core tracking loop exists today and is usable for local development:
 
 - `changed` manages user and system scoped config, tracked targets, history
-  views, and diff/redaction policy
+  views, pager output, and diff/redaction policy
 - `changedd` captures a baseline, watches one selected scope, and appends
   journal events
 - `changed service` can now install, start, stop, and inspect scoped systemd
   services
+- `changed status` reports scope-aware diagnostics for service state, tracked
+  targets, watcher roots, journal state, and daemon state
 
 ## Current Shape
 
@@ -34,7 +36,9 @@ The project currently has two binaries:
 
 The daemon is event-driven through `notify`, with scan/diff verification layered
 underneath for correctness. It captures an initial baseline, then records
-subsequent file-backed changes while it runs.
+subsequent file-backed changes while it runs. Internally it now blocks on
+watcher events and refreshes only the affected tracked path or directory
+descendant instead of rebuilding the whole tracked scope on every wake.
 
 ## Build And Run
 
@@ -84,17 +88,19 @@ See [docs/scope-model.md](docs/scope-model.md) for the detailed design.
 - Enable or disable diff storage per path
 - Enable or disable redaction per path
 - Filter history with `-i/--include` and `-e/--exclude`
-- Read merged history with `-SU` or with no scope flags
+- Read current-user history by default or merged history with `-SU`
 - Auto-reload daemon config when tracked targets change
 - Append a structured journal and render it as a readable changelog
 - Show a low-noise daily view with `changed list -C`
+- Open rendered history in a pager with `changed list --pager`
+- Clear retained history with `changed history clear -U`, `-S`, or `-SU`
 - Install and control scoped systemd services from the CLI
+- Inspect scope health with `changed status`
 
 ## What Does Not Exist Yet
 
 - package event tracking
 - service state event tracking
-- a dedicated `status` command for daemon diagnostics
 
 ## Scope-Aware CLI
 
@@ -110,6 +116,7 @@ changed list
 changed list -U
 sudo changed list -S
 sudo changed list -SU -a -C
+changed status
 ```
 
 If system scope is requested without privilege, `changed` now fails clearly and
@@ -135,6 +142,13 @@ For write operations such as `track`, `untrack`, `diff`, and `redact`:
 - if scope is unclear, the command fails and asks for `-S` or `-U`
 - category and package writes should be given an explicit scope
 
+`changed history clear` is the current exception. It accepts `-U`, `-S`, or
+`-SU`, and the destructive confirmation prompt explicitly names the scope it
+will clear.
+
+When `changed` is run under `sudo`, user scope still targets the invoking
+user's config and state directories rather than root's personal user scope.
+
 ## Service Integration
 
 Service commands now require an explicit scope:
@@ -156,6 +170,37 @@ Behavior:
 For local development installs, unit files are generated dynamically and point
 at the sibling `changedd` binary next to the current `changed` executable.
 
+Packaged upgrades do not restart either scoped unit automatically. Restart the
+scope you use explicitly after reinstalling or upgrading:
+
+```bash
+systemctl --user restart changedd.service
+sudo systemctl restart changedd.service
+```
+
+## Diagnostics
+
+`changed status` is the dedicated operational diagnostics command.
+
+It reports, per selected scope:
+
+- whether the scope is initialized
+- config, state, journal, and daemon-state paths
+- tracked path/package counts and tracked categories
+- watcher roots derived from the current config
+- service active/enabled state and daemon PID when available
+- last recorded event time and daemon-state update time
+- warnings for obvious problems such as inactive service, empty tracking, or local unit overrides
+
+Examples:
+
+```bash
+changed status
+changed status -U
+sudo changed status -S
+sudo changed status -SU
+```
+
 ## Journal Behavior
 
 - The first daemon scan captures a baseline without emitting synthetic events.
@@ -165,10 +210,16 @@ at the sibling `changedd` binary next to the current `changed` executable.
   newer ones.
 - `changed list` shows a recent view by default. Use `changed list -a` for the
   full retained journal.
-- `changed list` with no scope flags reads merged system plus current-user
-  history.
+- `changed list` with no scope flags reads current-user history by default.
+- `changed list -SU` reads merged system plus current-user history.
+- `changed list --pager` opens the output in `$PAGER` when set, or `less -R`
+  otherwise.
 - `-C, --clean-view` changes presentation only. It does not delete or rewrite
   history.
+- `changed history clear -U`, `changed history clear -S`, and
+  `changed history clear -SU` delete the stored journal and daemon baseline for
+  the selected scope or scopes after a destructive confirmation prompt that
+  names the target scope.
 
 ## Retention
 
@@ -308,3 +359,14 @@ systemctl --user enable --now changedd.service
 `changed service install` is mainly for local development or non-packaged
 installs where the unit should be generated dynamically from the current binary
 location.
+
+If you previously used `changed service install`, remove the generated override
+unit before switching to the packaged service, otherwise it will shadow the
+packaged unit under `/usr/lib/systemd`:
+
+```bash
+systemctl --user disable --now changedd.service
+rm -f ~/.config/systemd/user/changedd.service
+systemctl --user daemon-reload
+systemctl --user enable --now changedd.service
+```

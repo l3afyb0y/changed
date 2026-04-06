@@ -61,7 +61,7 @@ changed-only hunks, for example:
 ### 2:08pm
 Scope: user
 Category: shell
-/home/you/.config/fish/config.fish
+~/.config/fish/config.fish
 Changed shell config (+2)
 (+)[4] # test 4
 (+)[5] # test 5

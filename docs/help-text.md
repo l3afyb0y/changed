@@ -279,6 +279,10 @@ Options:
   -U, --user    Use user scope
       --once    Run one scan cycle and exit
   -h, --help    Print help
+
+Examples:
+  changed daemon -U
+  sudo changed daemon -S --once
 ```
 
 ## `changedd --help`
@@ -295,6 +299,10 @@ Options:
   --user                     Run in user scope
   -h, --help                 Show this help text
   -V, --version              Show version
+
+Examples:
+  changedd --user
+  changedd --system --once
 ```
 
 Behavior note:
@@ -315,7 +323,7 @@ Usage: changed init [OPTIONS]
 
 Behavior:
   Create config and state directories
-  Detect setup-aware presets for the chosen scope when /etc/changed/setup.toml exists
+  Load setup-aware presets when /etc/changed/setup.toml exists
   Enable default tracking presets
   Print the initial tracking summary
 ```

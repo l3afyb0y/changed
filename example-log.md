@@ -10,7 +10,7 @@ is aiming for.
 
 ## 04/03/26
 
-- 9:41am [user/shell] /home/rowen/.config/fish/config.fish: Changed shell config [metadata-only]
+- 9:41am [user/shell] ~/.config/fish/config.fish: Changed shell config [metadata-only]
 - 9:44am [system/boot] /boot/loader/entries/arch.conf: Changed boot config (+1/-1)
 - 9:47am [system/build] /etc/makepkg.conf: Changed build config (+2/-1)
 ```

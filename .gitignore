@@ -57,6 +57,7 @@ dist/
 
 # Built Arch packages
 *.pkg.tar.*
+changed/
 
 # Dev files
 docs/pre-release-checklist.md

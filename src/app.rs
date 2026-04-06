@@ -2,6 +2,7 @@ mod daemon;
 mod paths;
 mod render;
 mod service;
+mod setup;
 mod status;
 mod watch;
 
@@ -12,6 +13,7 @@ use crate::config::{
 };
 use crate::journal::JournalEvent;
 use crate::scope::Scope;
+use crate::setup::SetupProfile;
 use anyhow::{Context, Result, anyhow};
 use std::collections::VecDeque;
 use std::fs;
@@ -71,7 +73,8 @@ impl App {
         }
 
         let mut config = Config::new();
-        config.tracked_paths = detect_presets(scope)?;
+        let include_setup_only = self.load_setup_profile()?.is_some();
+        config.tracked_paths = detect_presets(self, scope, include_setup_only)?;
         config.sort_and_dedup();
         self.save_config(scope, &config)?;
 
@@ -158,6 +161,23 @@ impl App {
         status::render_status_report(self, scopes)
     }
 
+    pub fn setup(&self) -> Result<String> {
+        self.setup_with_profile(setup::detect_setup_profile())
+    }
+
+    pub(crate) fn setup_with_profile(&self, mut profile: SetupProfile) -> Result<String> {
+        profile.sort_and_dedup();
+        self.save_setup_profile(&profile)?;
+        let user_paths = self.apply_setup_presets_to_scope(Scope::User, true)?;
+        let system_paths = self.apply_setup_presets_to_scope(Scope::System, true)?;
+
+        Ok(render_setup_summary(
+            &self.shared_setup_file(),
+            &system_paths,
+            &user_paths,
+        ))
+    }
+
     pub fn track_file(&self, scope: Scope, raw_path: &str) -> Result<String> {
         let mut config = self.load_or_default(scope)?;
         let expanded = paths::expand_path(raw_path)?;
@@ -198,7 +218,7 @@ impl App {
 
     pub fn track_category(&self, scope: Scope, category: Category) -> Result<String> {
         let mut config = self.load_or_default(scope)?;
-        let preset_targets = preset_targets_for_category(scope, category)?;
+        let preset_targets = preset_targets_for_category(self, scope, category)?;
         if preset_targets.is_empty() {
             return Ok(format!(
                 "No matching preset paths were found for '{}' in {} scope.",
@@ -388,6 +408,20 @@ impl App {
         Ok(paths::infer_scope_for_path(&paths::expand_path(raw_path)?))
     }
 
+    pub(crate) fn load_setup_profile(&self) -> Result<Option<SetupProfile>> {
+        let path = self.shared_setup_file();
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read setup profile {}", path.display()))?;
+        let mut profile: SetupProfile = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse setup profile {}", path.display()))?;
+        profile.sort_and_dedup();
+        Ok(Some(profile))
+    }
+
     pub(crate) fn load_or_default(&self, scope: Scope) -> Result<Config> {
         let config_path = self.paths_for_scope(scope).config_file();
         if config_path.exists() {
@@ -416,6 +450,15 @@ impl App {
         let path = paths.config_file();
         let contents = toml::to_string_pretty(config).context("failed to serialize config")?;
         write_atomic(&path, "toml", contents.as_bytes(), scope)?;
+        Ok(())
+    }
+
+    fn save_setup_profile(&self, profile: &SetupProfile) -> Result<()> {
+        ensure_scope_directories(&self.system_paths)?;
+        let path = self.shared_setup_file();
+        let contents =
+            toml::to_string_pretty(profile).context("failed to serialize setup profile")?;
+        write_atomic_with_mode(&path, "toml", contents.as_bytes(), 0o644)?;
         Ok(())
     }
 
@@ -463,6 +506,43 @@ impl App {
                 .context("failed to write journal newline")?;
         }
         Ok(())
+    }
+
+    pub(crate) fn shared_setup_file(&self) -> PathBuf {
+        self.system_paths.config_home.join("setup.toml")
+    }
+
+    fn filesystem_root(&self) -> PathBuf {
+        self.system_paths
+            .config_home
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    fn user_home_for_presets(&self) -> Option<PathBuf> {
+        self.user_paths
+            .config_home
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    }
+
+    fn apply_setup_presets_to_scope(
+        &self,
+        scope: Scope,
+        include_setup_only: bool,
+    ) -> Result<Vec<TrackedPath>> {
+        let mut config = self.load_or_default(scope)?;
+        config
+            .tracked_paths
+            .retain(|entry| entry.source != TrackSource::Preset);
+        let applied = detect_presets(self, scope, include_setup_only)?;
+        config.tracked_paths.extend(applied.clone());
+        config.sort_and_dedup();
+        self.save_config(scope, &config)?;
+        Ok(applied)
     }
 
     pub(crate) fn load_events(&self, scope: Scope) -> Result<Vec<JournalEvent>> {
@@ -677,79 +757,128 @@ fn upsert_path(config: &mut Config, path: TrackedPath) {
     config.sort_and_dedup();
 }
 
-fn detect_presets(scope: Scope) -> Result<Vec<TrackedPath>> {
+fn detect_presets(app: &App, scope: Scope, include_setup_only: bool) -> Result<Vec<TrackedPath>> {
     let mut all = Vec::new();
     for category in Category::ALL {
         if category == Category::Packages {
             continue;
         }
-        all.extend(preset_targets_for_category(scope, category)?);
+        if !include_setup_only && is_setup_only_category(category) {
+            continue;
+        }
+        all.extend(preset_targets_for_category(app, scope, category)?);
     }
     Ok(all)
 }
 
-fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<TrackedPath>> {
-    let home = paths::home_dir().ok();
-    let profile = HardwareProfile::detect();
+fn preset_targets_for_category(
+    app: &App,
+    scope: Scope,
+    category: Category,
+) -> Result<Vec<TrackedPath>> {
+    let home = app.user_home_for_presets();
+    let root = app.filesystem_root();
 
     let candidates = match category {
         Category::Cpu => vec![
             Some(preset_file(
-                "/etc/default/cpupower",
+                root_join(&root, "/etc/default/cpupower"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
             )),
-            profile
-                .cpu_vendor
-                .filter(|vendor| *vendor == "amd")
-                .map(|_| {
-                    preset_file(
-                        "/etc/modprobe.d/amd-pstate.conf",
-                        category,
-                        DiffMode::Unified,
-                        RedactionMode::Off,
-                    )
-                }),
-            profile
-                .cpu_vendor
-                .filter(|vendor| *vendor == "intel")
-                .map(|_| {
-                    preset_file(
-                        "/etc/modprobe.d/intel-pstate.conf",
-                        category,
-                        DiffMode::Unified,
-                        RedactionMode::Off,
-                    )
-                }),
+            Some(preset_file(
+                root_join(&root, "/etc/modprobe.d/amd-pstate.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/intel-undervolt.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/default/cpupower-service.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/systemd/system/intel-pstate-pin.service"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/gamemode.ini"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
         ],
         Category::Gpu => vec![
-            profile
-                .gpu_vendor
-                .filter(|vendor| *vendor == "nvidia")
-                .map(|_| {
-                    preset_file(
-                        "/etc/modprobe.d/nvidia.conf",
-                        category,
-                        DiffMode::Unified,
-                        RedactionMode::Off,
-                    )
-                }),
-            profile
-                .gpu_vendor
-                .filter(|vendor| *vendor == "amd")
-                .map(|_| {
-                    preset_file(
-                        "/etc/X11/xorg.conf.d/20-amdgpu.conf",
-                        category,
-                        DiffMode::Unified,
-                        RedactionMode::Off,
-                    )
-                }),
+            Some(preset_file(
+                root_join(&root, "/etc/modprobe.d/nvidia.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/udev/rules.d/99-nvidia-irq-affinity.rules"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/nvidia_oc.json"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/X11/xorg.conf.d/20-amdgpu.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/X11/xorg.conf.d/20-intel.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            home.as_ref().map(|home| {
+                preset_dir(
+                    home.join(".config/hypr"),
+                    category,
+                    DiffMode::Unified,
+                    RedactionMode::Off,
+                )
+            }),
         ],
         Category::Services => vec![
             Some(preset_file(
-                "/etc/systemd/system.conf",
+                root_join(&root, "/etc/systemd/system.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/environment"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/dhcpcd.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/sudo.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
@@ -765,13 +894,13 @@ fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<T
         ],
         Category::Scheduler => vec![
             Some(preset_file(
-                "/etc/sysctl.d/99-scheduler.conf",
+                root_join(&root, "/etc/sysctl.d/99-scheduler.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
             )),
             Some(preset_file(
-                "/etc/udev/rules.d/60-ioschedulers.rules",
+                root_join(&root, "/etc/udev/rules.d/60-ioschedulers.rules"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
@@ -802,10 +931,16 @@ fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<T
                     RedactionMode::Auto,
                 )
             }),
+            Some(preset_file(
+                root_join(&root, "/etc/bash.bashrc"),
+                category,
+                DiffMode::MetadataOnly,
+                RedactionMode::Auto,
+            )),
         ],
         Category::Build => vec![
             Some(preset_file(
-                "/etc/makepkg.conf",
+                root_join(&root, "/etc/makepkg.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
@@ -818,22 +953,52 @@ fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<T
                     RedactionMode::Off,
                 )
             }),
-        ],
-        Category::Boot => vec![
             Some(preset_file(
-                "/etc/default/grub",
+                root_join(&root, "/etc/ccache.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
             )),
             Some(preset_file(
-                "/etc/mkinitcpio.conf",
+                root_join(&root, "/etc/pacman.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
             )),
             Some(preset_dir(
-                "/boot/loader/entries",
+                root_join(&root, "/etc/makepkg.conf.d"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_dir(
+                root_join(&root, "/etc/makepkg.d"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+        ],
+        Category::Boot => vec![
+            Some(preset_file(
+                root_join(&root, "/etc/fstab"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/default/grub"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_file(
+                root_join(&root, "/etc/mkinitcpio.conf"),
+                category,
+                DiffMode::Unified,
+                RedactionMode::Off,
+            )),
+            Some(preset_dir(
+                root_join(&root, "/boot/loader/entries"),
                 category,
                 DiffMode::MetadataOnly,
                 RedactionMode::Off,
@@ -857,7 +1022,7 @@ fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<T
                 )
             }),
             Some(preset_file(
-                "/etc/pipewire/pipewire.conf",
+                root_join(&root, "/etc/pipewire/pipewire.conf"),
                 category,
                 DiffMode::Unified,
                 RedactionMode::Off,
@@ -869,12 +1034,36 @@ fn preset_targets_for_category(scope: Scope, category: Category) -> Result<Vec<T
     Ok(candidates
         .into_iter()
         .flatten()
-        .filter(|entry| {
-            paths::infer_scope_for_path(Path::new(&entry.path))
-                .is_some_and(|entry_scope| entry_scope == scope)
-        })
+        .filter(|entry| preset_matches_scope(app, scope, Path::new(&entry.path)))
         .filter(|entry| Path::new(&entry.path).exists())
         .collect())
+}
+
+fn is_setup_only_category(category: Category) -> bool {
+    matches!(category, Category::Cpu | Category::Gpu | Category::Build)
+}
+
+fn root_join(root: &Path, absolute: &str) -> PathBuf {
+    let relative = absolute.strip_prefix('/').unwrap_or(absolute);
+    if root == Path::new("/") {
+        PathBuf::from(absolute)
+    } else {
+        root.join(relative)
+    }
+}
+
+fn preset_matches_scope(app: &App, scope: Scope, path: &Path) -> bool {
+    let user_home = app.user_home_for_presets();
+    let system_root = app.filesystem_root();
+    let system_etc = root_join(&system_root, "/etc");
+    let system_boot = root_join(&system_root, "/boot");
+
+    match scope {
+        Scope::User => user_home
+            .as_ref()
+            .is_some_and(|home| path.starts_with(home)),
+        Scope::System => path.starts_with(&system_etc) || path.starts_with(&system_boot),
+    }
 }
 
 fn preset_file<P: Into<PathBuf>>(
@@ -981,6 +1170,73 @@ fn pluralize(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn render_setup_summary(setup_file: &Path, system: &[TrackedPath], user: &[TrackedPath]) -> String {
+    let mut out = String::new();
+    out.push_str("Setup complete.\n");
+    out.push_str(&format!(
+        "Shared setup profile: {}\n\n",
+        setup_file.display()
+    ));
+    out.push_str("Files successfully tracked:\n\n");
+    render_setup_scope(&mut out, "System", system);
+    out.push('\n');
+    render_setup_scope(&mut out, "User", user);
+    out.push('\n');
+    out.push_str(
+        "If you want other files added, please use `changed track [args]` to add custom paths.\n",
+    );
+
+    let system_activity = service::query_service_activity(Scope::System);
+    let user_activity = service::query_service_activity(Scope::User);
+    if let Some(note) = render_setup_service_note(system_activity, user_activity) {
+        out.push('\n');
+        out.push_str(&note);
+        out.push('\n');
+    }
+
+    out.trim_end().to_owned()
+}
+
+fn render_setup_service_note(
+    system_activity: service::ServiceActivity,
+    user_activity: service::ServiceActivity,
+) -> Option<String> {
+    let mut lines = Vec::new();
+
+    if user_activity == service::ServiceActivity::Inactive {
+        lines.push(String::from(
+            "- User scope is not currently running. Run `systemctl --user enable --now changedd.service` to start tracking user files.",
+        ));
+    }
+
+    if system_activity == service::ServiceActivity::Inactive {
+        lines.push(String::from(
+            "- System scope is not currently running. Run `sudo systemctl enable --now changedd.service` to start tracking system files.",
+        ));
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("NOTE:\n{}", lines.join("\n")))
+    }
+}
+
+fn render_setup_scope(out: &mut String, label: &str, entries: &[TrackedPath]) {
+    out.push_str(label);
+    out.push_str(":\n");
+    if entries.is_empty() {
+        out.push_str("- none\n");
+        return;
+    }
+
+    for entry in entries {
+        out.push_str("- ");
+        out.push_str(&entry.path);
+        out.push('\n');
+    }
+}
+
 fn detect_path_kind(path: &Path) -> PathKind {
     if path.is_dir() {
         PathKind::Directory
@@ -1002,8 +1258,10 @@ fn ensure_scope_directories(paths: &AppPaths) -> Result<()> {
             paths.state_home.display()
         )
     })?;
-    set_scope_dir_permissions(&paths.config_home, paths.scope)?;
-    set_scope_dir_permissions(&paths.state_home, paths.scope)?;
+    set_scope_path_owner(&paths.config_home, paths.scope)?;
+    set_scope_path_owner(&paths.state_home, paths.scope)?;
+    set_scope_config_dir_permissions(&paths.config_home, paths.scope)?;
+    set_scope_state_dir_permissions(&paths.state_home)?;
     Ok(())
 }
 
@@ -1014,6 +1272,7 @@ fn write_atomic(path: &Path, extension: &str, contents: &[u8], scope: Scope) -> 
     ));
     fs::write(&temp_path, contents)
         .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
+    set_scope_path_owner(&temp_path, scope)?;
     set_scope_file_permissions(&temp_path, scope)?;
     fs::rename(&temp_path, path).with_context(|| {
         format!(
@@ -1022,6 +1281,7 @@ fn write_atomic(path: &Path, extension: &str, contents: &[u8], scope: Scope) -> 
             temp_path.display()
         )
     })?;
+    set_scope_path_owner(path, scope)?;
     set_scope_file_permissions(path, scope)?;
     Ok(())
 }
@@ -1046,16 +1306,26 @@ fn write_atomic_with_mode(path: &Path, extension: &str, contents: &[u8], mode: u
 }
 
 #[cfg(unix)]
-fn set_scope_dir_permissions(path: &Path, scope: Scope) -> Result<()> {
+fn set_scope_config_dir_permissions(path: &Path, scope: Scope) -> Result<()> {
     let mode = match scope {
-        Scope::System => 0o700,
+        Scope::System => 0o755,
         Scope::User => 0o700,
     };
     set_mode(path, mode)
 }
 
 #[cfg(not(unix))]
-fn set_scope_dir_permissions(_path: &Path, _scope: Scope) -> Result<()> {
+fn set_scope_config_dir_permissions(_path: &Path, _scope: Scope) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_scope_state_dir_permissions(path: &Path) -> Result<()> {
+    set_mode(path, 0o700)
+}
+
+#[cfg(not(unix))]
+fn set_scope_state_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1074,6 +1344,28 @@ fn set_scope_file_permissions(_path: &Path, _scope: Scope) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn set_scope_path_owner(path: &Path, scope: Scope) -> Result<()> {
+    use std::os::unix::fs::chown;
+
+    if scope != Scope::User || !nix::unistd::Uid::effective().is_root() {
+        return Ok(());
+    }
+
+    let Some((uid, gid)) = paths::sudo_user_owner()? else {
+        return Ok(());
+    };
+
+    chown(path, Some(uid.as_raw()), Some(gid.as_raw()))
+        .with_context(|| format!("failed to set ownership on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_scope_path_owner(_path: &Path, _scope: Scope) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1085,47 +1377,6 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
-}
-
-#[derive(Default)]
-struct HardwareProfile {
-    cpu_vendor: Option<&'static str>,
-    gpu_vendor: Option<&'static str>,
-}
-
-impl HardwareProfile {
-    fn detect() -> Self {
-        Self {
-            cpu_vendor: detect_cpu_vendor(),
-            gpu_vendor: detect_gpu_vendor(),
-        }
-    }
-}
-
-fn detect_cpu_vendor() -> Option<&'static str> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
-    if cpuinfo.contains("AuthenticAMD") {
-        Some("amd")
-    } else if cpuinfo.contains("GenuineIntel") {
-        Some("intel")
-    } else {
-        None
-    }
-}
-
-fn detect_gpu_vendor() -> Option<&'static str> {
-    if Path::new("/sys/module/nvidia").exists() {
-        return Some("nvidia");
-    }
-
-    let vendor_file = "/sys/class/drm/card0/device/vendor";
-    let vendor = fs::read_to_string(vendor_file).ok()?;
-    match vendor.trim() {
-        "0x1002" => Some("amd"),
-        "0x10de" => Some("nvidia"),
-        "0x8086" => Some("intel"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1155,13 +1406,13 @@ mod tests {
             App {
                 user_paths: AppPaths {
                     scope: Scope::User,
-                    config_home: self.root.join("user-config"),
-                    state_home: self.root.join("user-state"),
+                    config_home: self.root.join("home/.config/changed"),
+                    state_home: self.root.join("home/.local/state/changed"),
                 },
                 system_paths: AppPaths {
                     scope: Scope::System,
-                    config_home: self.root.join("system-config"),
-                    state_home: self.root.join("system-state"),
+                    config_home: self.root.join("etc/changed"),
+                    state_home: self.root.join("var/lib/changed"),
                 },
             }
         }
@@ -1220,9 +1471,7 @@ mod tests {
     fn track_category_adds_matching_presets() {
         let env = TestEnv::new();
         let app = env.app();
-        let fish_dir = paths::home_dir()
-            .expect("home should exist")
-            .join(".config/fish");
+        let fish_dir = env.root.join("home/.config/fish");
         fs::create_dir_all(&fish_dir).expect("fish config dir should be creatable");
         let fish_config = fish_dir.join("config.fish");
         if !fish_config.exists() {
@@ -1237,6 +1486,205 @@ mod tests {
                 .tracked_paths
                 .iter()
                 .any(|entry| entry.category == Category::Shell)
+        );
+    }
+
+    #[test]
+    fn setup_writes_shared_profile_and_applies_existing_setup_candidates() {
+        let env = TestEnv::new();
+        let app = env.app();
+
+        fs::create_dir_all(env.root.join("etc/modprobe.d")).expect("modprobe dir should exist");
+        fs::create_dir_all(env.root.join("etc/udev/rules.d")).expect("udev dir should exist");
+        fs::create_dir_all(env.root.join("etc/systemd/system")).expect("systemd dir should exist");
+        fs::create_dir_all(env.root.join("etc/default")).expect("default dir should exist");
+        fs::create_dir_all(env.root.join("home/.config/pacman"))
+            .expect("pacman config dir should exist");
+        fs::create_dir_all(env.root.join("home/.config/fish"))
+            .expect("fish config dir should exist");
+        fs::create_dir_all(env.root.join("home/.config/hypr/conf.d"))
+            .expect("hypr config dir should exist");
+
+        fs::write(
+            env.root.join("etc/modprobe.d/nvidia.conf"),
+            "options nvidia modeset=1\n",
+        )
+        .expect("nvidia modprobe config should exist");
+        fs::write(
+            env.root
+                .join("etc/udev/rules.d/99-nvidia-irq-affinity.rules"),
+            "ACTION==\"add\"\n",
+        )
+        .expect("nvidia irq affinity rule should exist");
+        fs::write(
+            env.root.join("etc/nvidia_oc.json"),
+            "{ \"sets\": { \"0\": {} } }\n",
+        )
+        .expect("nvidia oc json should exist");
+        fs::write(
+            env.root.join("etc/intel-undervolt.conf"),
+            "undervolt 0 'CPU' 0\n",
+        )
+        .expect("intel undervolt config should exist");
+        fs::write(
+            env.root.join("etc/default/cpupower-service.conf"),
+            "GOVERNOR='performance'\n",
+        )
+        .expect("cpupower service config should exist");
+        fs::write(
+            env.root.join("etc/systemd/system/intel-pstate-pin.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .expect("intel pstate service should exist");
+        fs::write(
+            env.root.join("home/.config/pacman/makepkg.conf"),
+            "MAKEFLAGS='-j16'\n",
+        )
+        .expect("user makepkg config should exist");
+        fs::write(
+            env.root.join("home/.config/fish/config.fish"),
+            "set -g fish_greeting \"\"\n",
+        )
+        .expect("fish config should exist");
+        fs::write(
+            env.root.join("home/.config/hypr/hyprland.conf"),
+            "$mod = SUPER\n",
+        )
+        .expect("hypr config should exist");
+
+        let output = app
+            .setup_with_profile(crate::setup::SetupProfile {
+                version: 1,
+                cpu_vendor: Some(crate::setup::CpuVendor::Intel),
+                gpu_vendors: vec![crate::setup::GpuVendor::Nvidia],
+                shells: vec![crate::setup::ShellKind::Fish],
+            })
+            .expect("setup should succeed");
+        assert!(output.contains("Files successfully tracked:"));
+        assert!(output.contains("System:"));
+        assert!(output.contains("User:"));
+        assert!(output.contains("/etc/modprobe.d/nvidia.conf"));
+        assert!(output.contains(".config/pacman/makepkg.conf"));
+        assert!(output.contains(".config/fish/config.fish"));
+        assert!(output.contains(".config/hypr"));
+        assert!(output.contains("changed track [args]"));
+
+        let saved = app
+            .load_setup_profile()
+            .expect("setup profile should load")
+            .expect("setup profile should exist");
+        assert_eq!(saved.cpu_vendor, Some(crate::setup::CpuVendor::Intel));
+        assert_eq!(saved.gpu_vendors, vec![crate::setup::GpuVendor::Nvidia]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let setup_mode = fs::metadata(app.shared_setup_file())
+                .expect("setup profile should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(setup_mode, 0o644);
+        }
+
+        let system_config = app
+            .load_config(Scope::System)
+            .expect("system config should load");
+        assert!(
+            system_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with("/etc/intel-undervolt.conf"))
+        );
+        assert!(
+            system_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with("/etc/modprobe.d/nvidia.conf"))
+        );
+        assert!(
+            system_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with("/etc/nvidia_oc.json"))
+        );
+
+        let user_config = app
+            .load_config(Scope::User)
+            .expect("user config should load");
+        assert!(
+            user_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with(".config/pacman/makepkg.conf"))
+        );
+        assert!(
+            user_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with(".config/fish/config.fish"))
+        );
+        assert!(
+            user_config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with(".config/hypr"))
+        );
+    }
+
+    #[test]
+    fn init_skips_setup_only_presets_until_setup_profile_exists() {
+        let env = TestEnv::new();
+        let app = env.app();
+
+        fs::create_dir_all(env.root.join("etc")).expect("etc dir should exist");
+        fs::write(env.root.join("etc/makepkg.conf"), "MAKEFLAGS='-j16'\n")
+            .expect("system makepkg config should exist");
+
+        app.init(Scope::System).expect("init should succeed");
+        let config = app.load_config(Scope::System).expect("config should load");
+
+        assert!(
+            !config
+                .tracked_paths
+                .iter()
+                .any(|entry| entry.path.ends_with("/etc/makepkg.conf"))
+        );
+    }
+
+    #[test]
+    fn setup_service_note_reports_each_inactive_scope() {
+        let note = render_setup_service_note(
+            service::ServiceActivity::Inactive,
+            service::ServiceActivity::Active,
+        )
+        .expect("system-only note should exist");
+        assert!(note.contains("System scope is not currently running"));
+        assert!(!note.contains("User scope is not currently running"));
+
+        let note = render_setup_service_note(
+            service::ServiceActivity::Active,
+            service::ServiceActivity::Inactive,
+        )
+        .expect("user-only note should exist");
+        assert!(note.contains("User scope is not currently running"));
+        assert!(!note.contains("System scope is not currently running"));
+
+        let note = render_setup_service_note(
+            service::ServiceActivity::Inactive,
+            service::ServiceActivity::Inactive,
+        )
+        .expect("dual-scope note should exist");
+        assert!(note.contains("User scope is not currently running"));
+        assert!(note.contains("System scope is not currently running"));
+
+        assert!(
+            render_setup_service_note(
+                service::ServiceActivity::Active,
+                service::ServiceActivity::Active
+            )
+            .is_none()
         );
     }
 
@@ -1631,14 +2079,20 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        let system_dir_mode = fs::metadata(&app.system_paths.state_home)
+        let system_state_dir_mode = fs::metadata(&app.system_paths.state_home)
             .expect("system state dir should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let system_config_dir_mode = fs::metadata(&app.system_paths.config_home)
+            .expect("system config dir should exist")
             .permissions()
             .mode()
             & 0o777;
 
         assert_eq!(user_dir_mode, 0o700);
-        assert_eq!(system_dir_mode, 0o700);
+        assert_eq!(system_state_dir_mode, 0o700);
+        assert_eq!(system_config_dir_mode, 0o755);
     }
 
     #[test]
@@ -1770,5 +2224,78 @@ mod tests {
                 .and_then(|entry| entry.text_snapshot.as_deref()),
             Some("line=1")
         );
+    }
+
+    #[test]
+    fn startup_scan_baselines_newly_tracked_paths_without_created_events() {
+        let previous = BTreeMap::from([(
+            "/home/test/.config/fish/config.fish".to_owned(),
+            daemon::ObservedPath {
+                scope: Scope::User,
+                path: "/home/test/.config/fish/config.fish".to_owned(),
+                category: Category::Shell,
+                diff_mode: DiffMode::MetadataOnly,
+                redaction: RedactionMode::Auto,
+                exists: true,
+                fingerprint: Some("fish".to_owned()),
+                text_snapshot: None,
+            },
+        )]);
+
+        let current = BTreeMap::from([
+            (
+                "/home/test/.config/fish/config.fish".to_owned(),
+                daemon::ObservedPath {
+                    scope: Scope::User,
+                    path: "/home/test/.config/fish/config.fish".to_owned(),
+                    category: Category::Shell,
+                    diff_mode: DiffMode::MetadataOnly,
+                    redaction: RedactionMode::Auto,
+                    exists: true,
+                    fingerprint: Some("fish".to_owned()),
+                    text_snapshot: None,
+                },
+            ),
+            (
+                "/home/test/.bashrc".to_owned(),
+                daemon::ObservedPath {
+                    scope: Scope::User,
+                    path: "/home/test/.bashrc".to_owned(),
+                    category: Category::Shell,
+                    diff_mode: DiffMode::MetadataOnly,
+                    redaction: RedactionMode::Auto,
+                    exists: true,
+                    fingerprint: Some("bash".to_owned()),
+                    text_snapshot: None,
+                },
+            ),
+        ]);
+
+        let config = Config {
+            version: 1,
+            retention: RetentionPolicy::default(),
+            tracked_paths: vec![
+                TrackedPath {
+                    path: "/home/test/.config/fish/config.fish".to_owned(),
+                    category: Category::Shell,
+                    kind: PathKind::File,
+                    diff_mode: DiffMode::MetadataOnly,
+                    redaction: RedactionMode::Auto,
+                    source: TrackSource::Preset,
+                },
+                TrackedPath {
+                    path: "/home/test/.bashrc".to_owned(),
+                    category: Category::Shell,
+                    kind: PathKind::File,
+                    diff_mode: DiffMode::MetadataOnly,
+                    redaction: RedactionMode::Auto,
+                    source: TrackSource::Preset,
+                },
+            ],
+            tracked_packages: Vec::new(),
+        };
+
+        let events = daemon::diff_startup_observed(&previous, &current, &config);
+        assert!(events.is_empty());
     }
 }

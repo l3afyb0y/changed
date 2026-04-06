@@ -14,6 +14,7 @@ Commands:
   init     Initialize config, state, and default presets
   daemon   Run the tracking daemon in the foreground
   service  Manage the changed systemd service
+  setup    Seed the full preset set and keep paths that exist
   history  Manage recorded history data
   track    Add a tracked file, category, or package target
   untrack  Remove a tracked file, category, or package target
@@ -28,6 +29,7 @@ Options:
 
 Examples:
   changed init
+  sudo changed setup
   changed track -U ~/.config/fish/config.fish
   sudo changed track -S /boot/loader/entries/arch.conf
   changed status
@@ -109,7 +111,7 @@ Behavior:
 With no scope flag, diagnostics default to current-user scope.
 `-SU` is a valid explicit merged diagnostics view.
 The command reports service state, paths, tracked target counts, watcher roots,
-journal state, daemon-state metadata, and warnings for obvious operational issues.
+journal state, setup profile state, daemon-state metadata, and warnings for obvious operational issues.
 ```
 
 Examples:
@@ -119,6 +121,33 @@ changed status
 changed status -U
 sudo changed status -S
 sudo changed status -SU
+```
+
+## `changed setup --help`
+
+```text
+Seed the full preset set and keep paths that exist
+
+Usage: changed setup
+
+Options:
+  -h, --help  Print help
+```
+
+Behavior:
+
+```text
+`changed setup` is machine-wide and requires sudo.
+It writes /etc/changed/setup.toml, scans preset candidate paths, updates both
+user and system config with the paths that actually exist, and prints what
+landed. It also warns per scope when the matching daemon is not running,
+without starting or restarting services.
+```
+
+Examples:
+
+```text
+sudo changed setup
 ```
 
 ## `changed history clear --help`
@@ -284,7 +313,7 @@ Usage: changed init [OPTIONS]
 
 Behavior:
   Create config and state directories
-  Detect host-specific presets for the chosen scope
+  Detect setup-aware presets for the chosen scope when /etc/changed/setup.toml exists
   Enable default tracking presets
   Print the initial tracking summary
 ```

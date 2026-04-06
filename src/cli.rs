@@ -32,6 +32,10 @@ pub fn run() -> Result<()> {
             ensure_privileged_scope(scope)?;
             println!("{}", app.service_action(args.action.as_str(), scope)?);
         }
+        Some(Commands::Setup(_args)) => {
+            ensure_root()?;
+            println!("{}", app.setup()?);
+        }
         Some(Commands::Status(args)) => {
             let scopes = args.scope_flags.resolve_read_scopes();
             ensure_privileged_scopes(&scopes)?;
@@ -185,7 +189,7 @@ pub fn run() -> Result<()> {
     about = "Lightweight system tuning changelog",
     long_about = None,
     override_usage = "changed <command> [options]",
-    after_help = "Examples:\n  changed init\n  changed track -U ~/.config/fish/config.fish\n  sudo changed track -S /boot/loader/entries/arch.conf\n  changed status\n  changed list -C\n  changed list -U -C\n  sudo changed list -SU -a\n\nRun `changed <command> --help` for command-specific help."
+    after_help = "Examples:\n  changed init\n  sudo changed setup\n  changed track -U ~/.config/fish/config.fish\n  sudo changed track -S /boot/loader/entries/arch.conf\n  changed status\n  changed list -C\n  changed list -U -C\n  sudo changed list -SU -a\n\nRun `changed <command> --help` for command-specific help."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -196,7 +200,7 @@ struct Cli {
 enum Commands {
     #[command(
         about = "Initialize config, state, and default presets",
-        after_help = "Behavior:\n  Create config and state directories\n  Detect host-specific presets\n  Enable default tracking presets\n  Print the initial tracking summary"
+        after_help = "Behavior:\n  Create config and state directories\n  Load setup-aware presets when /etc/changed/setup.toml exists\n  Enable default tracking presets\n  Print the initial tracking summary"
     )]
     Init(InitArgs),
     #[command(
@@ -209,6 +213,11 @@ enum Commands {
         after_help = "Notes:\n  Service commands require an explicit scope.\n  `install` writes a generated unit for local/dev or non-packaged installs.\n  For packaged installs, use `systemctl enable --now changedd.service` or\n  `systemctl --user enable --now changedd.service` directly.\n\nExamples:\n  changed service install -U\n  changed service start -U\n  sudo changed service install -S\n  sudo changed service status -S"
     )]
     Service(ServiceArgs),
+    #[command(
+        about = "Seed the full preset set and keep paths that exist",
+        after_help = "Notes:\n  `changed setup` is a machine-wide onboarding command.\n  It requires sudo, accepts no scope flags, writes a shared setup profile,\n  scans preset candidate paths, and updates both user and system config\n  with the paths that actually exist.\n  Missing candidates are skipped silently, and the command prints what landed.\n\nExamples:\n  sudo changed setup"
+    )]
+    Setup(SetupArgs),
     #[command(
         about = "Show operational diagnostics for changed",
         after_help = "Notes:\n  With no scope flags, `changed status` defaults to user scope.\n  Use `-SU` for a merged status view across both scopes.\n\nExamples:\n  changed status\n  changed status -U\n  sudo changed status -S\n  sudo changed status -SU"
@@ -311,6 +320,9 @@ struct InitArgs {
     #[command(flatten)]
     scope_flags: ScopeFlags,
 }
+
+#[derive(Args, Debug)]
+struct SetupArgs {}
 
 #[derive(Args, Debug)]
 struct TrackArgs {
@@ -569,6 +581,15 @@ fn ensure_privileged_scope(scope: Scope) -> Result<()> {
     Ok(())
 }
 
+fn ensure_root() -> Result<()> {
+    if !Uid::effective().is_root() {
+        return Err(anyhow!(
+            "`changed setup` is machine-wide and requires sudo."
+        ));
+    }
+    Ok(())
+}
+
 fn confirm_history_clear(scopes: &[Scope]) -> Result<bool> {
     let scope_label = match scopes {
         [Scope::User] => "user".to_owned(),
@@ -727,6 +748,7 @@ mod tests {
         for argv in [
             vec!["changed", "list", "--help"],
             vec!["changed", "status", "--help"],
+            vec!["changed", "setup", "--help"],
             vec!["changed", "track", "--help"],
             vec!["changed", "track", "-U", "--help"],
             vec!["changed", "track", "category", "--help"],
@@ -737,5 +759,11 @@ mod tests {
             let err = Cli::try_parse_from(argv).expect_err("expected clap help");
             assert_eq!(err.kind(), ErrorKind::DisplayHelp);
         }
+    }
+
+    #[test]
+    fn setup_rejects_scope_flags() {
+        assert!(Cli::try_parse_from(["changed", "setup", "-U"]).is_err());
+        assert!(Cli::try_parse_from(["changed", "setup", "-S"]).is_err());
     }
 }

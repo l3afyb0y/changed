@@ -38,6 +38,7 @@ The current codebase provides:
 - optional pager output for history views
 - scoped systemd service install/start/stop/status commands
 - a dedicated `changed status` diagnostics command
+- a machine-wide `changed setup` onboarding command
 
 Package tracking and service-state event tracking are still future work.
 
@@ -132,6 +133,24 @@ you use explicitly after reinstalling:
 - `systemctl --user restart changedd.service`
 - `sudo systemctl restart changedd.service`
 
+### `setup`
+
+Write a shared setup profile once and seed the full preset set for both scopes,
+keeping only the paths that actually exist.
+
+Current behavior:
+
+- requires root
+- accepts no scope flags
+- writes `/etc/changed/setup.toml`
+- scans preset candidate paths and silently skips missing files
+- updates preset-backed tracked paths in both user and system config
+- preserves manual tracked entries
+- prints the exact user/system paths it successfully tracked
+- warns per scope when the matching daemon is not currently running
+- does not start or restart services
+- does not add background polling
+
 ### `status`
 
 Show operational diagnostics for one or both scopes.
@@ -145,6 +164,7 @@ Supported today:
 The command reports:
 
 - whether the scope is initialized
+- shared setup profile path and detected hardware when present
 - config, state, journal, and daemon-state paths
 - tracked path/package counts and tracked categories
 - watcher roots derived from the current config
@@ -298,6 +318,7 @@ Typical local flow:
 
 - `cargo run --bin changed -- init -U`
 - `cargo run --bin changed -- init -S`
+- `sudo cargo run --bin changed -- setup`
 - `cargo run --bin changed -- track -U ~/.config/fish/config.fish`
 - `cargo run --bin changed -- track ~/.config/fish/config.fish -U`
 - `cargo run --bin changed -- status`
@@ -330,6 +351,7 @@ User scope:
 System scope:
 
 - config: `/etc/changed/config.toml`
+- setup profile: `/etc/changed/setup.toml`
 - state: `/var/lib/changed/`
 - journal: `/var/lib/changed/journal.jsonl`
 - daemon state: `/var/lib/changed/daemon-state.json`
@@ -372,6 +394,7 @@ old history can roll off over time until archival support exists.
 - `sudo changed list -S`
 - `sudo changed list -SU -a -C`
 - `changed status`
+- `sudo changed setup`
 - `sudo changed status -SU`
 - `changed list -i services`
 - `changed list -e packages`

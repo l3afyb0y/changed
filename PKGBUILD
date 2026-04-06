@@ -1,6 +1,6 @@
 # Hand-maintained PKGBUILD for Arch packaging.
 pkgname=changed
-pkgver=0.5.0
+pkgver=0.5.6
 pkgrel=1
 pkgdesc="Lightweight system tuning changelog daemon for Arch Linux"
 arch=('x86_64')

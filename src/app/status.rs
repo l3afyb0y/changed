@@ -1,23 +1,26 @@
 use crate::category::Category;
 use crate::config::Config;
 use crate::scope::Scope;
+use crate::setup::{CpuVendor, GpuVendor, SetupProfile, ShellKind};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::App;
 use super::paths::normalize_display_path;
-use super::service::{service_unit_install_path, systemd_unit_name};
+use super::service::{build_systemctl_command, service_unit_install_path, systemd_unit_name};
 use super::watch::{WatchPlan, WatchRootSummary};
 
 #[derive(Clone, Debug)]
 struct ScopeStatus {
     scope: Scope,
     initialized: bool,
+    setup_profile_path: PathBuf,
+    setup_profile_exists: bool,
+    setup_profile: Option<SetupProfile>,
     config_path: PathBuf,
     config_exists: bool,
     state_path: PathBuf,
@@ -69,6 +72,8 @@ pub fn render_status_report(app: &App, scopes: &[Scope]) -> Result<String> {
 
 fn collect_scope_status(app: &App, scope: Scope) -> ScopeStatus {
     let paths = app.paths_for_scope(scope);
+    let setup_profile_path = app.shared_setup_file();
+    let setup_profile_exists = setup_profile_path.exists();
     let config_path = paths.config_file();
     let journal_path = paths.journal_file();
     let daemon_state_path = paths.daemon_state_file();
@@ -97,6 +102,10 @@ fn collect_scope_status(app: &App, scope: Scope) -> ScopeStatus {
         Ok(state) => (Some(state.observed.len()), None),
         Err(err) => (None, Some(err.to_string())),
     };
+    let (setup_profile, setup_error) = match app.load_setup_profile() {
+        Ok(profile) => (profile, None),
+        Err(err) => (None, Some(err.to_string())),
+    };
 
     let daemon_state_updated = file_timestamp(&daemon_state_path);
     let categories = collect_categories(&config);
@@ -113,8 +122,16 @@ fn collect_scope_status(app: &App, scope: Scope) -> ScopeStatus {
     if let Some(error) = &daemon_state_error {
         warnings.push(format!("Daemon state could not be read: {error}"));
     }
+    if let Some(error) = &setup_error {
+        warnings.push(format!("Setup profile could not be read: {error}"));
+    }
     if !config_exists && !journal_exists && !daemon_state_exists {
         warnings.push(String::from("Scope is not initialized yet."));
+    }
+    if !setup_profile_exists {
+        warnings.push(String::from(
+            "Machine setup has not been run yet. Some preset-backed paths may still be missing.",
+        ));
     }
     if config_exists && config.tracked_paths.is_empty() && config.tracked_packages.is_empty() {
         warnings.push(String::from("Nothing is currently tracked for this scope."));
@@ -147,6 +164,9 @@ fn collect_scope_status(app: &App, scope: Scope) -> ScopeStatus {
     ScopeStatus {
         scope,
         initialized,
+        setup_profile_path,
+        setup_profile_exists,
+        setup_profile,
         config_path,
         config_exists,
         state_path: paths.state_home.clone(),
@@ -187,10 +207,7 @@ fn query_service_status(scope: Scope) -> ServiceStatus {
         ..ServiceStatus::default()
     };
 
-    let mut command = Command::new("systemctl");
-    if scope == Scope::User {
-        command.arg("--user");
-    }
+    let mut command = build_systemctl_command(scope);
     command.args([
         "show",
         systemd_unit_name(),
@@ -267,6 +284,44 @@ fn render_scope_status(out: &mut String, status: &ScopeStatus) {
             if status.initialized { "yes" } else { "no" }
         ),
     );
+    let _ = std::fmt::Write::write_fmt(
+        out,
+        format_args!(
+            "Setup profile: {}{}\n",
+            status.setup_profile_path.display(),
+            existence_label(status.setup_profile_exists)
+        ),
+    );
+    if let Some(profile) = &status.setup_profile {
+        let cpu = profile
+            .cpu_vendor
+            .map(cpu_vendor_label)
+            .unwrap_or("unknown");
+        let gpus = if profile.gpu_vendors.is_empty() {
+            String::from("none")
+        } else {
+            profile
+                .gpu_vendors
+                .iter()
+                .map(|vendor| gpu_vendor_label(*vendor))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let shells = if profile.shells.is_empty() {
+            String::from("none")
+        } else {
+            profile
+                .shells
+                .iter()
+                .map(|shell| shell_kind_label(*shell))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = std::fmt::Write::write_fmt(
+            out,
+            format_args!("Setup details: cpu={cpu} | gpu={gpus} | shells={shells}\n"),
+        );
+    }
     let _ = std::fmt::Write::write_fmt(
         out,
         format_args!(
@@ -385,6 +440,29 @@ fn pluralize(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn cpu_vendor_label(vendor: CpuVendor) -> &'static str {
+    match vendor {
+        CpuVendor::Intel => "intel",
+        CpuVendor::Amd => "amd",
+    }
+}
+
+fn gpu_vendor_label(vendor: GpuVendor) -> &'static str {
+    match vendor {
+        GpuVendor::Nvidia => "nvidia",
+        GpuVendor::Amd => "amd",
+        GpuVendor::Intel => "intel",
+    }
+}
+
+fn shell_kind_label(shell: ShellKind) -> &'static str {
+    match shell {
+        ShellKind::Bash => "bash",
+        ShellKind::Fish => "fish",
+        ShellKind::Zsh => "zsh",
+    }
+}
+
 impl ServiceStatus {
     fn is_active(&self) -> bool {
         self.active_state.as_deref() == Some("active")
@@ -400,6 +478,9 @@ mod tests {
         let status = ScopeStatus {
             scope: Scope::User,
             initialized: false,
+            setup_profile_path: PathBuf::from("/tmp/setup.toml"),
+            setup_profile_exists: false,
+            setup_profile: None,
             config_path: PathBuf::from("/tmp/config.toml"),
             config_exists: false,
             state_path: PathBuf::from("/tmp/state"),

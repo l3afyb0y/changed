@@ -6,6 +6,13 @@ use std::process::Command;
 
 use super::paths::home_dir;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceActivity {
+    Active,
+    Inactive,
+    Unknown,
+}
+
 pub fn daemon_binary_path() -> Result<PathBuf> {
     let current = env::current_exe().context("failed to detect current executable")?;
     let file_name = current
@@ -65,10 +72,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut command = Command::new("systemctl");
-    if scope == Scope::User {
-        command.arg("--user");
-    }
+    let mut command = build_systemctl_command(scope);
     for arg in args {
         command.arg(arg.as_ref());
     }
@@ -96,6 +100,38 @@ where
     }
 }
 
+pub fn query_service_activity(scope: Scope) -> ServiceActivity {
+    let mut command = build_systemctl_command(scope);
+    command.args(["is-active", "--quiet", systemd_unit_name()]);
+
+    match command.status() {
+        Ok(status) if status.success() => ServiceActivity::Active,
+        Ok(status) if status.code().is_some() => ServiceActivity::Inactive,
+        Ok(_) => ServiceActivity::Unknown,
+        Err(_) => ServiceActivity::Unknown,
+    }
+}
+
+pub fn build_systemctl_command(scope: Scope) -> Command {
+    let mut command = Command::new("systemctl");
+    if scope == Scope::User {
+        if let Some(username) = sudo_user_name() {
+            command.arg("--machine");
+            command.arg(format!("{username}@.host"));
+        }
+        command.arg("--user");
+    }
+    command
+}
+
 pub fn systemd_unit_name() -> &'static str {
     "changedd.service"
+}
+
+fn sudo_user_name() -> Option<String> {
+    if !nix::unistd::Uid::effective().is_root() {
+        return None;
+    }
+
+    env::var("SUDO_USER").ok().filter(|value| !value.is_empty())
 }

@@ -20,10 +20,12 @@ The core tracking loop exists today and is usable for local development:
   views, pager output, and diff/redaction policy
 - `changedd` captures a baseline, watches one selected scope, and appends
   journal events
+- `changed setup` writes a shared machine profile and seeds the full preset set
+  for both scopes, skipping missing paths
 - `changed service` can now install, start, stop, and inspect scoped systemd
   services
 - `changed status` reports scope-aware diagnostics for service state, tracked
-  targets, watcher roots, journal state, and daemon state
+  targets, watcher roots, setup profile, journal state, and daemon state
 
 ## Current Shape
 
@@ -95,6 +97,7 @@ See [docs/scope-model.md](docs/scope-model.md) for the detailed design.
 - Open rendered history in a pager with `changed list --pager`
 - Clear retained history with `changed history clear -U`, `-S`, or `-SU`
 - Install and control scoped systemd services from the CLI
+- Bootstrap supported machine-specific preset tracking with `sudo changed setup`
 - Inspect scope health with `changed status`
 
 ## What Does Not Exist Yet
@@ -178,6 +181,39 @@ systemctl --user restart changedd.service
 sudo systemctl restart changedd.service
 ```
 
+## Setup
+
+`changed setup` is the machine-wide onboarding command.
+
+Use it after install when you want `changed` to write a shared setup profile
+and seed the full preset set for both scopes, keeping only the paths that
+actually exist:
+
+```bash
+sudo changed setup
+```
+
+Current v1 behavior:
+
+- writes `/etc/changed/setup.toml`
+- records detected CPU, GPU, and shell information
+- scans preset candidate paths and tracks the ones that exist
+- updates preset-backed tracked paths in both user and system config
+- preserves manual tracked entries
+- prints the exact user/system paths it successfully tracked
+- warns per scope when the matching daemon is not currently running
+- does not start or restart services
+- does not add background polling
+
+The initial setup pass is intentionally narrow and honest:
+
+- CPU tuning files
+- GPU tuning files
+- Arch build-tuning files such as `makepkg.conf`
+- user shell config files
+- user Hyprland config directories
+- shell detection is recorded for future expansion
+
 ## Diagnostics
 
 `changed status` is the dedicated operational diagnostics command.
@@ -185,6 +221,7 @@ sudo systemctl restart changedd.service
 It reports, per selected scope:
 
 - whether the scope is initialized
+- shared setup profile path and detected hardware when present
 - config, state, journal, and daemon-state paths
 - tracked path/package counts and tracked categories
 - watcher roots derived from the current config
@@ -265,6 +302,7 @@ source = "preset"
 System scope uses separate config and state roots:
 
 - config: `/etc/changed/config.toml`
+- setup profile: `/etc/changed/setup.toml`
 - state: `/var/lib/changed/`
 
 ## Safety Model
@@ -301,6 +339,7 @@ User scope:
 System scope:
 
 - Config: `/etc/changed/config.toml`
+- Setup profile: `/etc/changed/setup.toml`
 - State: `/var/lib/changed/`
 - Journal: `/var/lib/changed/journal.jsonl`
 - Daemon state: `/var/lib/changed/daemon-state.json`

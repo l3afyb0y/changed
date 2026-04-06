@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver};
-use std::time::SystemTime;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use walkdir::WalkDir;
 
@@ -21,6 +21,7 @@ use super::{App, DaemonOptions};
 
 const MAX_DIFF_BYTES: u64 = 256 * 1024;
 const WORK_QUEUE_CAPACITY: usize = 256;
+const WORK_BATCH_DEBOUNCE: Duration = Duration::from_millis(75);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ObservedPath {
@@ -252,8 +253,17 @@ fn next_work_batch(rx: &Receiver<WorkItem>) -> Result<Vec<WorkItem>> {
         .recv()
         .context("watcher channel disconnected; daemon worker cannot continue")?;
     let mut items = vec![first];
-    while let Ok(item) = rx.try_recv() {
-        items.push(item);
+    loop {
+        match rx.recv_timeout(WORK_BATCH_DEBOUNCE) {
+            Ok(item) => items.push(item),
+            Err(RecvTimeoutError::Timeout) => {
+                while let Ok(item) = rx.try_recv() {
+                    items.push(item);
+                }
+                break;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
     Ok(items)
 }
@@ -267,7 +277,7 @@ fn run_full_scan(
 ) -> Result<Vec<JournalEvent>> {
     let observed = observe_tracked_paths(scope, config)?;
     let events = if had_existing_state || !state.observed.is_empty() {
-        diff_observed(&state.observed, &observed)
+        diff_startup_observed(&state.observed, &observed, config)
     } else {
         Vec::new()
     };
@@ -280,6 +290,46 @@ fn run_full_scan(
         app.save_daemon_state(scope, state)?;
     }
     Ok(events)
+}
+
+pub(crate) fn diff_startup_observed(
+    previous: &BTreeMap<String, ObservedPath>,
+    current: &BTreeMap<String, ObservedPath>,
+    config: &Config,
+) -> Vec<JournalEvent> {
+    let mut keys = BTreeSet::new();
+    keys.extend(previous.keys().cloned());
+    keys.extend(current.keys().cloned());
+
+    let mut events = Vec::new();
+    for key in keys {
+        let before = previous.get(&key);
+        let after = current.get(&key);
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                if let Some(event) = diff_pair(Some(before), Some(after)) {
+                    events.push(event);
+                }
+            }
+            (Some(before), None) => {
+                if should_emit_removed_on_startup(config, &before.path)
+                    && let Some(event) = diff_pair(Some(before), None)
+                {
+                    events.push(event);
+                }
+            }
+            (None, Some(after)) => {
+                if should_emit_created_on_startup(previous, config, &after.path)
+                    && let Some(event) = diff_pair(None, Some(after))
+                {
+                    events.push(event);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    events
 }
 
 fn refresh_directory(
@@ -371,6 +421,37 @@ fn tracked_entry_for_observed_path<'a>(config: &'a Config, path: &Path) -> Optio
         }
     }
     matched
+}
+
+fn should_emit_created_on_startup(
+    previous: &BTreeMap<String, ObservedPath>,
+    config: &Config,
+    path: &str,
+) -> bool {
+    let Some(tracked) = tracked_entry_for_observed_path(config, Path::new(path)) else {
+        return false;
+    };
+
+    match tracked.kind {
+        PathKind::File => false,
+        PathKind::Directory => previous_directory_has_baseline(previous, &tracked.path),
+    }
+}
+
+fn should_emit_removed_on_startup(config: &Config, path: &str) -> bool {
+    matches!(
+        tracked_entry_for_observed_path(config, Path::new(path)),
+        Some(TrackedPath {
+            kind: PathKind::Directory,
+            ..
+        })
+    )
+}
+
+fn previous_directory_has_baseline(previous: &BTreeMap<String, ObservedPath>, root: &str) -> bool {
+    previous
+        .keys()
+        .any(|key| key == root || key.starts_with(&format!("{root}/")))
 }
 
 fn diff_pair(before: Option<&ObservedPath>, after: Option<&ObservedPath>) -> Option<JournalEvent> {
@@ -550,24 +631,35 @@ fn build_diff(before: Option<&ObservedPath>, after: Option<&ObservedPath>) -> Op
 
     let diff = TextDiff::from_lines(old, new);
     let mut lines = Vec::new();
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
     for change in diff.iter_all_changes() {
         match change.tag() {
-            similar::ChangeTag::Delete => lines.push(format!("(-) {}", change)),
-            similar::ChangeTag::Insert => lines.push(format!("(+) {}", change)),
-            similar::ChangeTag::Equal => {}
+            similar::ChangeTag::Delete => {
+                lines.push(format!(
+                    "(-)[{old_line}] {}",
+                    change.to_string().trim_end_matches('\n')
+                ));
+                old_line += 1;
+            }
+            similar::ChangeTag::Insert => {
+                lines.push(format!(
+                    "(+)[{new_line}] {}",
+                    change.to_string().trim_end_matches('\n')
+                ));
+                new_line += 1;
+            }
+            similar::ChangeTag::Equal => {
+                old_line += 1;
+                new_line += 1;
+            }
         }
     }
 
     if lines.is_empty() {
         None
     } else {
-        Some(
-            lines
-                .into_iter()
-                .map(|line| line.trim_end_matches('\n').to_owned())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        Some(lines.join("\n"))
     }
 }
 
@@ -615,9 +707,9 @@ fn diff_line_counts(diff: Option<&str>) -> (usize, usize) {
     let mut removed = 0;
     if let Some(diff) = diff {
         for line in diff.lines() {
-            if line.starts_with("(+) ") {
+            if line.starts_with("(+)") {
                 added += 1;
-            } else if line.starts_with("(-) ") {
+            } else if line.starts_with("(-)") {
                 removed += 1;
             }
         }
@@ -798,4 +890,59 @@ fn system_time_secs(value: SystemTime) -> Option<u64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn next_work_batch_coalesces_short_rewrite_bursts() {
+        let (tx, rx) = mpsc::sync_channel(8);
+        tx.send(WorkItem::RefreshPath(PathBuf::from("/tmp/config.fish")))
+            .expect("first work item should send");
+
+        let delayed = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            delayed
+                .send(WorkItem::RefreshPath(PathBuf::from("/tmp/config.fish")))
+                .expect("second work item should send");
+        });
+
+        let batch = next_work_batch(&rx).expect("batch should collect");
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn build_diff_only_reports_changed_lines_with_line_numbers() {
+        let before = ObservedPath {
+            scope: Scope::User,
+            path: "/tmp/config.fish".to_owned(),
+            category: Category::Shell,
+            diff_mode: DiffMode::Unified,
+            redaction: RedactionMode::Auto,
+            exists: true,
+            fingerprint: Some("before".to_owned()),
+            text_snapshot: Some(
+                "# Fish Shell Configuration\n# test\nif status is-interactive\n".to_owned(),
+            ),
+        };
+        let after = ObservedPath {
+            scope: Scope::User,
+            path: "/tmp/config.fish".to_owned(),
+            category: Category::Shell,
+            diff_mode: DiffMode::Unified,
+            redaction: RedactionMode::Auto,
+            exists: true,
+            fingerprint: Some("after".to_owned()),
+            text_snapshot: Some(
+                "# Fish Shell Configuration\nif status is-interactive\n".to_owned(),
+            ),
+        };
+
+        let diff = build_diff(Some(&before), Some(&after)).expect("diff should exist");
+        assert_eq!(diff, "(-)[2] # test");
+    }
 }

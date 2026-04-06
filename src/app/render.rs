@@ -228,9 +228,9 @@ pub fn render_history(
             let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{}\n", event.summary));
             if let Some(diff) = &event.diff {
                 for line in diff.lines() {
-                    let styled = if line.starts_with("(+) ") {
+                    let styled = if line.starts_with("(+)") {
                         palette.add(line)
-                    } else if line.starts_with("(-) ") {
+                    } else if line.starts_with("(-)") {
                         palette.remove(line)
                     } else {
                         line.to_owned()

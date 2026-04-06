@@ -37,6 +37,7 @@ Current features include:
 - optional pager output for history views
 - scoped service install, start, stop, and status commands
 - a dedicated *changed status* diagnostics command
+- a machine-wide *changed setup* onboarding command
 
 Still planned:
 
@@ -97,12 +98,23 @@ user's config and state directories rather than root's personal user scope.
 	- systemctl --user restart changedd.service
 	- sudo systemctl restart changedd.service
 
+*setup*
+	Write a shared setup profile once and seed the full preset set for both
+	scopes, keeping only the paths that actually exist.
+
+	It requires root, accepts no scope flags, writes
+	*/etc/changed/setup.toml*, silently skips missing candidates, preserves
+	manual tracked entries, prints the exact paths it tracked, warns per scope
+	when the matching daemon is not running, and does not start or restart
+	services.
+
 *status*
 	Show operational diagnostics for one or both scopes.
 
-	It reports scope paths, tracked counts, categories, watcher roots, service
-	state, daemon PID when available, recent journal/daemon-state metadata, and
-	warnings for obvious operational issues.
+	It reports scope paths, shared setup profile state, tracked counts,
+	categories, watcher roots, service state, daemon PID when available,
+	recent journal/daemon-state metadata, and warnings for obvious operational
+	issues.
 
 *track*
 	Track a file path, category preset, or package target in one scope.
@@ -160,6 +172,7 @@ healthy, configured, and actively recording changes.
 Typical local commands:
 
 - *cargo run --bin changed -- init -U*
+- *sudo cargo run --bin changed -- setup*
 - *cargo run --bin changed -- track -U ~/.config/fish/config.fish*
 - *cargo run --bin changed -- track ~/.config/fish/config.fish -U*
 - *cargo run --bin changed -- status*
@@ -180,6 +193,7 @@ User scope:
 System scope:
 
 - /etc/changed/config.toml
+- /etc/changed/setup.toml
 - /var/lib/changed/journal.jsonl
 - /var/lib/changed/daemon-state.json
 

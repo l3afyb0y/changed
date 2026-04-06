@@ -1,7 +1,7 @@
 use crate::scope::Scope;
 use anyhow::{Context, Result};
 use directories::BaseDirs;
-use nix::unistd::{Uid, User};
+use nix::unistd::{Gid, Uid, User};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +87,18 @@ pub fn normalize_display_path(path: &Path) -> String {
 
 pub fn home_dir() -> Result<PathBuf> {
     user_home_dir()
+}
+
+#[cfg(unix)]
+pub(crate) fn sudo_user_owner() -> Result<Option<(Uid, Gid)>> {
+    let Some(uid) = sudo_uid()? else {
+        return Ok(None);
+    };
+
+    let user = User::from_uid(uid)
+        .context("failed to resolve sudo user by uid")?
+        .context("sudo user uid did not resolve to an account")?;
+    Ok(Some((uid, user.gid)))
 }
 
 fn entry_scope(path: &Path) -> Option<Scope> {

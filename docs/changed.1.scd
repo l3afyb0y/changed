@@ -43,6 +43,8 @@ Still planned:
 
 - package event tracking
 - service-state event tracking
+- CLI config management
+- setup refinement
 
 # SCOPE MODEL
 
@@ -62,8 +64,7 @@ valid explicit merged read of system plus current-user history.
 
 For write commands, exactly one scope must usually be targeted. The current
 exception is *changed history clear*, which also accepts *-SU* to clear both
-scopes in one confirmed operation. If scope cannot be inferred safely, the
-command should fail and ask for *-S* or *-U*.
+scopes in one confirmed operation.
 
 When *changed* is run under sudo, user scope still refers to the invoking
 user's config and state directories rather than root's personal user scope.
@@ -87,20 +88,13 @@ user's config and state directories rather than root's personal user scope.
 	- stop
 	- status
 
-	The *install* action writes a generated scope-specific unit and runs
-	daemon-reload. For packaged installs, the unit files are already shipped
-	under /usr/lib/systemd, so *install* is mainly for local development or
-	non-packaged installs.
-
-	Packaged upgrades do not restart either scope automatically. Restart the
-	scope you use explicitly after reinstalling:
-
-	- systemctl --user restart changedd.service
-	- sudo systemctl restart changedd.service
+	The *install* action writes a generated scope-specific unit for local/dev
+	or non-packaged installs. For packaged installs, the unit files are already
+	shipped under /usr/lib/systemd.
 
 *setup*
-	Write a shared setup profile once and seed the full preset set for both
-	scopes, keeping only the paths that actually exist.
+	Write a shared setup profile once and seed preset-backed tracked paths for
+	both scopes, keeping only the paths that actually exist.
 
 	It requires root, accepts no scope flags, writes
 	*/etc/changed/setup.toml*, silently skips missing candidates, preserves
@@ -113,8 +107,8 @@ user's config and state directories rather than root's personal user scope.
 
 	It reports scope paths, shared setup profile state, tracked counts,
 	categories, watcher roots, service state, daemon PID when available,
-	recent journal/daemon-state metadata, and warnings for obvious operational
-	issues.
+	recent journal and daemon-state metadata, and warnings for obvious
+	operational issues.
 
 *track*
 	Track a file path, category preset, or package target in one scope.
@@ -147,11 +141,14 @@ Useful flags:
 - *-a*, *--all* to show full retained history
 - *-C*, *--clean-view* for a low-noise view
 - *--color* auto|always|never to control ANSI color output
-- *--pager* to open the rendered output in $PAGER or less -R
+- *-P*, *--pager* to open the rendered output in the standard $PAGER command or less -R
 - *-i*, *--include* CATEGORY to keep only matching categories
 - *-e*, *--exclude* CATEGORY to remove categories from the result
 
 If both include and exclude are present, exclusion wins.
+
+For tracked files using unified diffs, history entries show only changed lines
+with line numbers. Unchanged context lines are currently omitted.
 
 # DAEMON BEHAVIOR
 
@@ -207,4 +204,6 @@ Environment overrides:
 These override the config and state roots, so they also control where journal
 files are stored. There is no separate CHANGED_LIST_LOCATION because
 *changed list* reads from the journal inside the selected scope's state
-directory. $PAGER is only used when *changed list --pager* is requested.
+directory. The standard $PAGER command is only used when *changed list -P*,
+*changed list --pager*, *changed status -P*, or *changed status --pager* is
+requested.

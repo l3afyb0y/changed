@@ -433,8 +433,9 @@ struct ListArgs {
     #[arg(long = "color", value_enum, default_value_t = ColorMode::Auto, help = "Control color output")]
     color: ColorMode,
     #[arg(
+        short = 'P',
         long = "pager",
-        help = "Open output in $PAGER (or less -R) instead of printing directly"
+        help = "Open output in the standard $PAGER command (or less -R) instead of printing directly"
     )]
     pager: bool,
 }
@@ -477,8 +478,9 @@ struct StatusArgs {
     #[command(flatten)]
     scope_flags: ScopeFlags,
     #[arg(
+        short = 'P',
         long = "pager",
-        help = "Open output in $PAGER (or less -R) instead of printing directly"
+        help = "Open output in the standard $PAGER command (or less -R) instead of printing directly"
     )]
     pager: bool,
 }
@@ -650,9 +652,9 @@ fn emit_output(output: &str, pager: bool) -> Result<()> {
 
 fn emit_via_pager(output: &str) -> Result<()> {
     let pager = std::env::var("PAGER").unwrap_or_else(|_| String::from("less -R"));
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&pager)
+    let (program, args) = parse_pager_command(&pager)?;
+    let mut child = Command::new(&program)
+        .args(&args)
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to launch pager `{pager}`"))?;
@@ -670,6 +672,15 @@ fn emit_via_pager(output: &str) -> Result<()> {
     } else {
         Err(anyhow!("pager `{pager}` exited with status {status}"))
     }
+}
+
+fn parse_pager_command(raw: &str) -> Result<(String, Vec<String>)> {
+    let parts = shlex::split(raw)
+        .ok_or_else(|| anyhow!("pager command contains invalid quoting: `{raw}`"))?;
+    let (program, args) = parts
+        .split_first()
+        .ok_or_else(|| anyhow!("pager command is empty"))?;
+    Ok((program.clone(), args.to_vec()))
 }
 
 #[cfg(test)]
@@ -765,5 +776,20 @@ mod tests {
     fn setup_rejects_scope_flags() {
         assert!(Cli::try_parse_from(["changed", "setup", "-U"]).is_err());
         assert!(Cli::try_parse_from(["changed", "setup", "-S"]).is_err());
+    }
+
+    #[test]
+    fn pager_command_parses_without_shell() {
+        let (program, args) = parse_pager_command("less -R").expect("pager should parse");
+        assert_eq!(program, "less");
+        assert_eq!(args, vec!["-R"]);
+    }
+
+    #[test]
+    fn pager_command_supports_quoted_arguments() {
+        let (program, args) =
+            parse_pager_command("bat --pager \"less -FR\"").expect("pager should parse");
+        assert_eq!(program, "bat");
+        assert_eq!(args, vec!["--pager", "less -FR"]);
     }
 }

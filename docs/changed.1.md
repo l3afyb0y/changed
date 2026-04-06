@@ -2,7 +2,7 @@
 
 ## NAME
 
-`changed` - lightweight system tuning changelog for Systemd-based Linux distros.
+`changed` - lightweight system tuning changelog for systemd-based Linux systems.
 
 ## SYNOPSIS
 
@@ -20,7 +20,7 @@ changes while its daemon is running.
 It is designed to answer:
 
 - What did I change over time?
-- Which changes were related to CPU, GPU, services, shell, boot, or other tuning?
+- Which changes were related to CPU, GPU, services, shell, boot, or build tuning?
 - What do I need to carry forward to a new install or new hardware?
 
 `changed` is not a backup, rollback, snapshot, or recovery tool.
@@ -40,11 +40,12 @@ The current codebase provides:
 - a dedicated `changed status` diagnostics command
 - a machine-wide `changed setup` onboarding command
 
-Package tracking and service-state event tracking are still future work.
+Package tracking, service-state event tracking, CLI config management, and
+setup refinement are still future work.
 
 ## SCOPE MODEL
 
-`changed` now works with two scopes:
+`changed` works with two scopes:
 
 - system scope
 - user scope
@@ -73,9 +74,7 @@ valid explicit merged read of system plus current-user history.
 
 For write commands, exactly one scope must usually be targeted. The current
 exception is `changed history clear`, which also accepts `-SU` to clear both
-scopes in one confirmed operation. If scope cannot be inferred safely for a
-path-based write, the command should fail and ask the user to specify `-S` or
-`-U`.
+scopes in one confirmed operation.
 
 When `changed` is run under `sudo`, user scope continues to refer to the
 invoking user's config and state directories rather than root's personal user
@@ -117,26 +116,18 @@ Service commands require an explicit scope.
 
 Current behavior:
 
-- `install` writes a generated scope-specific unit file and runs `daemon-reload`
+- `install` writes a generated scope-specific unit file for local/dev or non-packaged installs
 - `start` runs `enable --now` for that scope
 - `stop` runs `disable --now` for that scope
 - `status` runs `systemctl status` for that scope
 
-For packaged Arch installs, the unit files are already shipped under
-`/usr/lib/systemd`. In that case, `install` is mainly useful for local
-development or non-packaged installs where the unit should be generated from
-the current binary location.
-
-Packaged upgrades do not restart either scope automatically. Restart the scope
-you use explicitly after reinstalling:
-
-- `systemctl --user restart changedd.service`
-- `sudo systemctl restart changedd.service`
+For packaged installs, the unit files are already shipped under `/usr/lib/systemd`.
+Packaged upgrades do not restart either scope automatically.
 
 ### `setup`
 
-Write a shared setup profile once and seed the full preset set for both scopes,
-keeping only the paths that actually exist.
+Write a shared setup profile once and seed preset-backed tracked paths for both
+scopes, keeping only the paths that actually exist.
 
 Current behavior:
 
@@ -159,7 +150,7 @@ Supported today:
 
 - `-S`, `--system`
 - `-U`, `--user`
-- `--pager`
+- `-P`, `--pager`
 
 The command reports:
 
@@ -203,7 +194,7 @@ Supported today:
 - `-s`, `--since <time>`
 - `-u`, `--until <time>`
 - `-C`, `--clean-view`
-- `--pager`
+- `-P`, `--pager`
 
 ### `diff <action> <path>`
 
@@ -246,8 +237,9 @@ Default output should:
 
 `changed list -C` provides a low-noise day-to-day reading mode.
 
-`changed list --pager` opens the rendered output in `$PAGER` when set, or in
-`less -R` otherwise.
+`changed list -P`, `changed list --pager`, `changed status -P`, and
+`changed status --pager` open the rendered output in the standard `$PAGER`
+command when set, or in `less -R` otherwise.
 
 `--clean-view` changes presentation only. It does not delete data, alter
 history, or change what the daemon stores.
@@ -259,53 +251,22 @@ Category filter semantics:
 - repeated filters are allowed
 - exclusion wins if both are present
 
+For tracked files using unified diffs, history entries show only changed lines
+with line numbers. Unchanged context lines are currently omitted.
+
 ## DAEMON BEHAVIOR
 
-The daemon currently uses an event-driven watcher with scan/diff verification.
-Internally it blocks on watcher events and refreshes only the affected tracked
-path or directory descendant instead of rebuilding the entire tracked scope on
-every wake.
+The daemon uses an event-driven watcher with scan and diff verification.
 
-- The first daemon run captures a baseline without emitting synthetic events.
-- Config changes are reloaded automatically.
-- Newly added tracked targets are silently baselined on reload.
-- Existing tracked targets preserve prior observation state across reloads.
-
-The same `changedd` binary now supports both:
-
-- `--system`
-- `--user`
-
-This is intended to become:
-
-- one system service
-- one optional user service per user
-
-Packaged unit files are also provided for Arch installs.
-
-For packaged installs, enabling the service normally uses `systemctl` directly
-rather than `changed service install`.
+- the first daemon run captures a baseline without emitting synthetic events
+- config changes are reloaded automatically
+- newly added tracked targets are silently baselined on reload
+- existing tracked targets preserve prior observation state across reloads
+- watcher events refresh only the affected tracked path or tracked-directory
+  descendant instead of rebuilding the whole tracked scope
 
 `changed status` is the preferred command for checking whether a scope is
 healthy, configured, and actively recording changes.
-
-## SECURITY MODEL
-
-Tracking, diffing, and redaction are separate controls.
-
-- Tracking decides whether a target is watched.
-- Diff decides whether readable line changes are stored.
-- Redaction decides whether stored diffs should mask likely sensitive values.
-
-The current security direction is:
-
-- system journals and state should be root-owned and root-readable only
-- user journals, state, and config should be private to the owning user
-- user-scope workflows should not require `sudo` by default
-- shell and environment-adjacent files should stay conservative by default
-
-Redaction is heuristic, not perfect. Highly sensitive files should still be
-handled carefully.
 
 ## DEVELOPMENT
 
@@ -323,21 +284,7 @@ Typical local flow:
 - `cargo run --bin changed -- track ~/.config/fish/config.fish -U`
 - `cargo run --bin changed -- status`
 - `cargo run --bin changedd -- --user --once`
-- `cargo run --bin changed -- list -SU -a`
-- `cargo run --bin changed -- service -U install`
-
-## PACKAGE TRACKING
-
-Package tracking stays optional and disabled by default.
-
-When expanded later, package events should prefer:
-
-- installs
-- removals
-- replacements
-
-Routine package updates should remain disabled by default to avoid flooding the
-changelog with normal Arch maintenance activity.
+- `cargo run --bin changed -- list -U -C`
 
 ## FILES
 
@@ -364,16 +311,7 @@ Environment overrides:
 - `CHANGED_SYSTEM_STATE_HOME`
 
 These override the config and state roots, so they also control where journal
-files are stored:
-
-- user journal: `$CHANGED_STATE_HOME/journal.jsonl`
-- system journal: `$CHANGED_SYSTEM_STATE_HOME/journal.jsonl`
-
-There is no separate `CHANGED_LIST_LOCATION` because `changed list` reads from
-the journal inside the selected scope's state directory.
-
-`$PAGER` is a standard shell environment variable used only when
-`changed list --pager` is requested.
+files are stored.
 
 ## RETENTION
 
@@ -383,9 +321,6 @@ The local journal currently uses bounded retention with default values:
 - `max_bytes = 8 MiB`
 
 When these limits are exceeded, the oldest stored events are trimmed.
-
-These limits keep the local journal lightweight today, but they also mean very
-old history can roll off over time until archival support exists.
 
 ## EXAMPLES
 
@@ -412,12 +347,14 @@ old history can roll off over time until archival support exists.
 
 ## NOTES
 
-`changed` is meant to preserve a useful memory of tuning and system changes.
-It should optimize for readable historical context, not recovery workflows.
+`changed` should optimize for readable historical context, not recovery
+workflows.
 
 See also:
 
 - `README.md`
+- `docs/getting-started.md`
+- `docs/operations.md`
 - `docs/help-text.md`
 - `docs/scope-model.md`
 - `docs/categories.md`

@@ -1,7 +1,6 @@
 # Help Text Drafts
 
-These drafts reflect the current CLI surface after the modular CLI and
-event-driven daemon refactor.
+These drafts reflect the current CLI surface in `0.5.8`.
 
 ## `changed --help`
 
@@ -15,6 +14,7 @@ Commands:
   daemon   Run the tracking daemon in the foreground
   service  Manage the changed systemd service
   setup    Seed the full preset set and keep paths that exist
+  status   Show operational diagnostics for changed
   history  Manage recorded history data
   track    Add a tracked file, category, or package target
   untrack  Remove a tracked file, category, or package target
@@ -59,36 +59,31 @@ Options:
   -S, --system              Use system scope
   -U, --user                Use user scope
   -t, --tracked             Show tracked targets instead of change events
-  -i, --include <CATEGORY>  Include only matching categories
-  -e, --exclude <CATEGORY>  Exclude matching categories
+  -i, --include <CATEGORY>  Include only matching categories [possible values: cpu, gpu, services,
+                            scheduler, shell, build, boot, audio, packages]
+  -e, --exclude <CATEGORY>  Exclude matching categories [possible values: cpu, gpu, services,
+                            scheduler, shell, build, boot, audio, packages]
   -p, --path <PATH>         Filter by exact tracked path
   -a, --all                 Show full retained history
   -s, --since <TIME>        Show entries since TIME (RFC3339)
   -u, --until <TIME>        Show entries until TIME (RFC3339)
   -C, --clean-view          Show a low-noise view of relevant changes
-      --color <COLOR>       Control color output [default: auto]
-      --pager               Open output in $PAGER (or less -R) instead of printing directly
+      --color <COLOR>       Control color output [default: auto] [possible values: auto, always,
+                            never]
+  -P, --pager               Open output in the standard $PAGER command (or less -R) instead of printing directly
   -h, --help                Print help
-```
 
-Behavior:
-
-```text
-With no scope flag, reads default to current-user output.
-`-SU` is a valid explicit merged read of system plus current-user history.
-Under sudo, `-U` still refers to the invoking user's config/state, not root's.
-```
+Notes:
+  With no scope flags, `changed list` defaults to user scope.
 
 Examples:
-
-```text
-changed list
-changed list -U
-sudo changed list -S
-sudo changed list -SU -a -C
-changed list -i services
-changed list -e packages
-changed list -SU -C -i cpu -i gpu -e services
+  changed list
+  changed list -U
+  sudo changed list -S
+  sudo changed list -SU -a -C
+  changed list -i services
+  changed list -e packages
+  changed list -SU -C -i cpu -i gpu -e services
 ```
 
 ## `changed status --help`
@@ -101,26 +96,18 @@ Usage: changed status [OPTIONS]
 Options:
   -S, --system  Use system scope
   -U, --user    Use user scope
-      --pager   Open output in $PAGER (or less -R) instead of printing directly
+  -P, --pager   Open output in the standard $PAGER command (or less -R) instead of printing directly
   -h, --help    Print help
-```
 
-Behavior:
-
-```text
-With no scope flag, diagnostics default to current-user scope.
-`-SU` is a valid explicit merged diagnostics view.
-The command reports service state, paths, tracked target counts, watcher roots,
-journal state, setup profile state, daemon-state metadata, and warnings for obvious operational issues.
-```
+Notes:
+  With no scope flags, `changed status` defaults to user scope.
+  Use `-SU` for a merged status view across both scopes.
 
 Examples:
-
-```text
-changed status
-changed status -U
-sudo changed status -S
-sudo changed status -SU
+  changed status
+  changed status -U
+  sudo changed status -S
+  sudo changed status -SU
 ```
 
 ## `changed setup --help`
@@ -132,22 +119,36 @@ Usage: changed setup
 
 Options:
   -h, --help  Print help
-```
 
-Behavior:
-
-```text
-`changed setup` is machine-wide and requires sudo.
-It writes /etc/changed/setup.toml, scans preset candidate paths, updates both
-user and system config with the paths that actually exist, and prints what
-landed. It also warns per scope when the matching daemon is not running,
-without starting or restarting services.
-```
+Notes:
+  `changed setup` is a machine-wide onboarding command.
+  It requires sudo, accepts no scope flags, writes a shared setup profile,
+  scans preset candidate paths, and updates both user and system config
+  with the paths that actually exist.
+  Missing candidates are skipped silently, and the command prints what landed.
 
 Examples:
+  sudo changed setup
+```
+
+## `changed history --help`
 
 ```text
-sudo changed setup
+Manage recorded history data
+
+Usage: changed history <COMMAND>
+
+Commands:
+  clear  Clear stored journal data for one or both scopes
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+Examples:
+  changed history clear -U
+  sudo changed history clear -S
+  sudo changed history clear -SU
 ```
 
 ## `changed history clear --help`
@@ -157,9 +158,15 @@ Clear stored journal data for one or both scopes
 
 Usage: changed history clear [OPTIONS]
 
-Behavior:
-  Prompts before deleting the selected scope's journal and daemon baseline files.
-  `-SU` is allowed here and the prompt explicitly names both scopes.
+Options:
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+  -h, --help    Print help
+
+Examples:
+  changed history clear -U
+  sudo changed history clear -S
+  sudo changed history clear -SU
 ```
 
 ## `changed track --help`
@@ -175,24 +182,20 @@ Options:
   -S, --system  Use system scope
   -U, --user    Use user scope
   -h, --help    Print help
-```
+
+Scope:
+  -S, --system          Track in system scope
+  -U, --user            Track in user scope
 
 Notes:
-
-```text
-Writes must target exactly one scope.
-Paths may infer scope automatically when obvious.
-Category and package writes should be given an explicit scope.
-Scope flags are accepted before or after the target path.
-```
+  Writes must target exactly one scope.
+  Paths may infer scope automatically when obvious.
 
 Examples:
-
-```text
-changed track -U ~/.config/fish/config.fish
-changed track ~/.config/fish/config.fish -U
-sudo changed track -S /boot/loader/entries/arch.conf
-changed track -U category shell
+  changed track -U ~/.config/fish/config.fish
+  changed track ~/.config/fish/config.fish -U
+  sudo changed track -S /boot/loader/entries/arch.conf
+  changed track -U category shell
 ```
 
 ## `changed untrack --help`
@@ -216,14 +219,6 @@ Notes:
 Writes must target exactly one scope.
 `-SU` remains invalid here even though `changed history clear` accepts it.
 Scope flags are accepted before or after the target path.
-```
-
-Examples:
-
-```text
-changed untrack -U ~/.config/fish/config.fish
-changed untrack ~/.config/fish/config.fish -U
-sudo changed untrack -S /boot/loader/entries/arch.conf
 ```
 
 ## `changed diff --help`
@@ -250,19 +245,26 @@ Usage: changed redact [scope] enable <path>
 Manage the changed systemd service
 
 Usage: changed service [OPTIONS] <ACTION>
-```
+
+Arguments:
+  <ACTION>  [possible values: install, start, stop, status]
+
+Options:
+  -S, --system  Use system scope
+  -U, --user    Use user scope
+  -h, --help    Print help
 
 Notes:
+  Service commands require an explicit scope.
+  `install` writes a generated unit for local/dev or non-packaged installs.
+  For packaged installs, use `systemctl enable --now changedd.service` or
+  `systemctl --user enable --now changedd.service` directly.
 
-```text
-Service commands require an explicit scope.
-`install` writes a generated unit file and runs daemon-reload.
-`start` enables and starts the unit for that scope.
-`stop` disables and stops the unit for that scope.
-For packaged installs, the unit files already exist under /usr/lib/systemd,
-so `install` is mainly for local/dev or non-packaged setups.
-Packaged upgrades do not restart either scope automatically; restart the scope
-you use explicitly after reinstalling.
+Examples:
+  changed service install -U
+  changed service start -U
+  sudo changed service install -S
+  sudo changed service status -S
 ```
 
 ## `changed daemon --help`

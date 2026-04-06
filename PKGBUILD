@@ -1,28 +1,31 @@
 # Hand-maintained PKGBUILD for Arch packaging.
 pkgname=changed
-pkgver=0.5.9
+pkgver=0.5.9.r0.ga4f767d
 pkgrel=1
-pkgdesc="Lightweight system tuning changelog daemon for Arch Linux"
+pkgdesc="Lightweight system tuning changelog daemon for Arch Linux (git version)"
 arch=('x86_64')
 url="https://github.com/l3afyb0y/changed"
 license=('MIT')
 depends=('systemd')
-makedepends=('cargo' 'scdoc')
+makedepends=('cargo' 'git' 'scdoc')
 options=('!lto')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  git describe --long --tags --abbrev=7 --match 'v[0-9]*' \
+    | sed 's/^v//;s/-/.r/;s/-/./'
+}
 
 build() {
-  cd "$startdir"
+  cd "$srcdir/$pkgname"
   cargo build --locked --release
   scdoc < "docs/changed.1.scd" > "docs/changed.1"
 }
 
-check() {
-  cd "$startdir"
-  cargo test --locked
-}
-
 package() {
-  cd "$startdir"
+  cd "$srcdir/$pkgname"
 
   install -Dm755 "build/cargo/release/changed" "$pkgdir/usr/bin/changed"
   install -Dm755 "build/cargo/release/changedd" "$pkgdir/usr/bin/changedd"

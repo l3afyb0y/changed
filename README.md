@@ -45,7 +45,25 @@ Still planned:
 
 ## Quick Start
 
-Packaged installs already ship both systemd unit files. After installing the
+### Installation
+
+Arch-based distros:
+
+```bash
+yay -S changed
+```
+
+Or use your preferred AUR helper.
+
+If you prefer to build it yourself:
+
+```bash
+git clone https://github.com/l3afyb0y/changed.git
+cd changed
+makepkg -si
+```
+
+Packaged installs ship both systemd unit files. After installing the
 package, a normal first run looks like this:
 
 ```bash

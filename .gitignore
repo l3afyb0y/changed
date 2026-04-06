@@ -63,7 +63,7 @@ docs/pre-release-checklist.md
 docs/potential-improvements.md
 scripts/
 scripts/measure-daemon-cpu.sh
-plans/
+docs/plans/
 wiki/
 
 # Generated man page

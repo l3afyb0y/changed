@@ -215,37 +215,23 @@ pub fn retention_start_index(events: &[JournalEvent], retention: &RetentionPolic
         return 0;
     }
 
-    let mut start = events.len().saturating_sub(retention.max_events);
+    let lower_bound = events.len().saturating_sub(retention.max_events);
+    let mut start = events.len();
     let mut encoded_size = 0u64;
-    for event in events.iter().skip(start).rev() {
-        let line_size = serde_json::to_string(event)
-            .map(|line| line.len() as u64 + 1)
-            .unwrap_or(0);
+
+    for index in (lower_bound..events.len()).rev() {
+        let Ok(line) = serde_json::to_string(&events[index]) else {
+            break;
+        };
+        let line_size = line.len() as u64 + 1;
         if encoded_size + line_size > retention.max_bytes {
             break;
         }
         encoded_size += line_size;
-        start = start.saturating_sub(1);
+        start = index;
     }
 
-    while start < events.len() {
-        let retained = &events[start..];
-        let count_ok = retained.len() <= retention.max_events;
-        let bytes_ok = retained
-            .iter()
-            .try_fold(0u64, |acc, event| {
-                serde_json::to_string(event)
-                    .map(|line| acc + line.len() as u64 + 1)
-                    .ok()
-            })
-            .is_some_and(|size| size <= retention.max_bytes);
-        if count_ok && bytes_ok {
-            break;
-        }
-        start += 1;
-    }
-
-    start.min(events.len())
+    start
 }
 
 fn next_work_batch(rx: &Receiver<WorkItem>) -> Result<Vec<WorkItem>> {
@@ -573,7 +559,7 @@ fn observe_single_path(
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let fingerprint = blake3::hash(&bytes).to_hex().to_string();
     let text_snapshot = if diff_mode == DiffMode::Unified && metadata.len() <= MAX_DIFF_BYTES {
-        String::from_utf8(bytes.clone())
+        String::from_utf8(bytes)
             .ok()
             .map(|text| maybe_redact_text(text, redaction))
     } else {

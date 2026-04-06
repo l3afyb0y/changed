@@ -660,9 +660,17 @@ fn emit_via_pager(output: &str) -> Result<()> {
         .with_context(|| format!("failed to launch pager `{pager}`"))?;
 
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(output.as_bytes())?;
-        if !output.ends_with('\n') {
-            stdin.write_all(b"\n")?;
+        let write_result = stdin.write_all(output.as_bytes()).and_then(|()| {
+            if !output.ends_with('\n') {
+                stdin.write_all(b"\n")
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = write_result {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(e.into());
+            }
         }
     }
 

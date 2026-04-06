@@ -52,8 +52,8 @@ pub fn render_systemd_unit(scope: Scope, daemon_path: &Path) -> String {
     };
 
     format!(
-        "[Unit]\nDescription={description}\nAfter={after_target}\n\n[Service]\nType=simple\nExecStart={} {}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=yes\nPrivateTmp=yes\n\n[Install]\nWantedBy={wanted_by}\n",
-        daemon_path.display(),
+        "[Unit]\nDescription={description}\nAfter={after_target}\n\n[Service]\nType=simple\nExecStart=\"{}\" {}\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=yes\nPrivateTmp=yes\n\n[Install]\nWantedBy={wanted_by}\n",
+        daemon_path.display().to_string().replace('"', "\\\""),
         scope_flag
     )
 }

@@ -1856,9 +1856,9 @@ mod tests {
         let system = service::render_systemd_unit(Scope::System, Path::new("/usr/bin/changedd"));
         let user = service::render_systemd_unit(Scope::User, Path::new("/usr/bin/changedd"));
 
-        assert!(system.contains("ExecStart=/usr/bin/changedd --system"));
+        assert!(system.contains("ExecStart=\"/usr/bin/changedd\" --system"));
         assert!(system.contains("WantedBy=multi-user.target"));
-        assert!(user.contains("ExecStart=/usr/bin/changedd --user"));
+        assert!(user.contains("ExecStart=\"/usr/bin/changedd\" --user"));
         assert!(user.contains("WantedBy=default.target"));
     }
 

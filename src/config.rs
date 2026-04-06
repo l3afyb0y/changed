@@ -74,13 +74,21 @@ impl Config {
     }
 
     pub fn sort_and_dedup(&mut self) {
+        // Sort by path first so adjacent dedup_by works correctly across all categories,
+        // then re-sort by the intended display order (category, path, kind).
+        self.tracked_paths.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.category.cmp(&b.category))
+                .then_with(|| path_kind_rank(a.kind).cmp(&path_kind_rank(b.kind)))
+        });
+        self.tracked_paths.dedup_by(|a, b| a.path == b.path);
         self.tracked_paths.sort_by(|a, b| {
             a.category
                 .cmp(&b.category)
                 .then_with(|| a.path.cmp(&b.path))
                 .then_with(|| path_kind_rank(a.kind).cmp(&path_kind_rank(b.kind)))
         });
-        self.tracked_paths.dedup_by(|a, b| a.path == b.path);
 
         self.tracked_packages.sort_by(|a, b| {
             a.manager

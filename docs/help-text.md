@@ -1,6 +1,6 @@
 # Help Text Drafts
 
-These drafts reflect the current CLI surface in `0.5.8`.
+These drafts reflect the current CLI surface in `0.5.9`.
 
 ## `changed --help`
 

@@ -43,6 +43,10 @@ changed list
 - prints the exact paths it added
 - warns per scope if the matching daemon is not running
 
+If `changed list` still shows no history on a fresh install, make sure
+`sudo changed setup` has been run and the daemon is enabled for the scope you
+expect.
+
 The current preset-backed default path list is documented in
 [default-tracked-paths.md](default-tracked-paths.md).
 

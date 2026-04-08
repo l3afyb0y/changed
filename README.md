@@ -74,6 +74,10 @@ changed status -U
 sudo changed status -S
 ```
 
+`sudo changed setup` is the first required step for preset-backed tracking.
+If `changed list` still shows no history on a fresh install, make sure setup
+has been run and the daemon is enabled for the scope you expect.
+
 If you only want private per-user tracking, start only the user service:
 
 ```bash
@@ -140,7 +144,6 @@ sudo cargo run --bin changedd -- --system --once
 - [CLI help reference](docs/help-text.md)
 - [Man page source](docs/changed.1.md)
 - [Planned improvements](docs/planned-improvements.md)
-- [Pre-release checklist](docs/pre-release-checklist.md)
 
 ## Packaging
 

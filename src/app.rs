@@ -142,7 +142,7 @@ impl App {
             return Ok(if any_journal {
                 String::from("No change history matched that filter.")
             } else {
-                String::from("No change history recorded yet.")
+                render_no_history_message(self.load_setup_profile()?.is_some())
             });
         }
         Ok(render::render_history(
@@ -1237,6 +1237,16 @@ fn render_setup_scope(out: &mut String, label: &str, entries: &[TrackedPath]) {
     }
 }
 
+fn render_no_history_message(has_setup_profile: bool) -> String {
+    if has_setup_profile {
+        String::from("No change history recorded yet.")
+    } else {
+        String::from(
+            "No change history recorded yet.\nIf you have not run `sudo changed setup` yet, start there.",
+        )
+    }
+}
+
 fn detect_path_kind(path: &Path) -> PathKind {
     if path.is_dir() {
         PathKind::Directory
@@ -1860,6 +1870,29 @@ mod tests {
         assert!(system.contains("WantedBy=multi-user.target"));
         assert!(user.contains("ExecStart=\"/usr/bin/changedd\" --user"));
         assert!(user.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn empty_history_mentions_setup_when_machine_setup_has_not_run() {
+        let env = TestEnv::new();
+        let app = env.app();
+
+        let output = app
+            .list_history(HistoryQuery {
+                scopes: &[Scope::User],
+                include: &[],
+                exclude: &[],
+                path: None,
+                all: false,
+                since: None,
+                until: None,
+                clean: false,
+                color: false,
+            })
+            .expect("empty history should render");
+
+        assert!(output.contains("No change history recorded yet."));
+        assert!(output.contains("sudo changed setup"));
     }
 
     #[test]
